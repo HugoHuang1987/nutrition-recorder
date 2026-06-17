@@ -842,6 +842,82 @@ summary {
   white-space: pre-wrap;
 }
 
+.ai-audit-box {
+  display: grid;
+  gap: 8px;
+  margin-top: 12px;
+  padding: 12px;
+  border: 1px solid var(--soft-line);
+  border-left: 4px solid var(--amber);
+  border-radius: 8px;
+  background: #fffaf1;
+  font-size: 13px;
+}
+
+.ai-audit-box.audit-pass {
+  border-left-color: var(--teal);
+  background: #f7fffc;
+}
+
+.ai-audit-box.audit-error {
+  border-left-color: var(--red);
+  background: var(--red-soft);
+}
+
+.ai-audit-box.audit-loading {
+  border-left-color: var(--blue);
+  background: #f8fbff;
+}
+
+.audit-title {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 10px;
+}
+
+.audit-title span {
+  color: var(--muted);
+  font-size: 12px;
+  font-weight: 700;
+}
+
+.ai-audit-box p {
+  margin: 0;
+}
+
+.ai-audit-box ul {
+  display: grid;
+  gap: 7px;
+  margin: 0;
+  padding: 0;
+  list-style: none;
+}
+
+.audit-finding {
+  display: grid;
+  gap: 3px;
+  padding: 8px;
+  border: 1px solid var(--soft-line);
+  border-radius: 8px;
+  background: #fff;
+}
+
+.audit-finding span,
+.audit-finding em {
+  color: var(--muted);
+  font-size: 12px;
+  font-style: normal;
+}
+
+.audit-finding.warning {
+  border-color: #ead7b8;
+}
+
+.audit-finding.error {
+  border-color: #ecc4c4;
+}
+
 .report {
   padding: 26px 30px 34px;
   background: #fff;

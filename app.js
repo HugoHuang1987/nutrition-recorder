@@ -63,6 +63,9 @@ const TURING_AI_PRESET = {
   useWebSearch: false,
 };
 
+const CUMULATIVE_GLYCOGEN_WATER_MIN_KG = -0.8;
+const CUMULATIVE_GLYCOGEN_WATER_MAX_KG = 0.3;
+
 const PROCESS_TYPES = {
   muscle_loss: {
     label: "保持肌肉减重",
@@ -597,6 +600,8 @@ let selectedMeal = "早餐";
 let selectedCategory = "全部";
 let lastParsed = null;
 let saveTimer = null;
+let autoAuditTimer = null;
+let aiAuditRunId = 0;
 let aiInputImages = [];
 
 const els = {
@@ -619,6 +624,7 @@ const els = {
   aiInputStatus: document.getElementById("aiInputStatus"),
   imagePreviewList: document.getElementById("imagePreviewList"),
   aiAnswerBox: document.getElementById("aiAnswerBox"),
+  aiAuditBox: document.getElementById("aiAuditBox"),
   unmatchedBox: document.getElementById("unmatchedBox"),
   todayStats: document.getElementById("todayStats"),
   statsGrid: document.getElementById("statsGrid"),
@@ -699,6 +705,7 @@ function bindEvents() {
   }
 
   els.dietText.addEventListener("input", () => {
+    clearAiAuditResult();
     updateReport();
     setSaveStatus("待AI解读并保存");
   });
@@ -761,6 +768,7 @@ function loadSelectedRecord() {
   if (els.recordDate) els.recordDate.value = selectedDate;
   els.dietText.value = record?.rawText || "";
   if (els.dailyWeight) els.dailyWeight.value = record?.weight || "";
+  clearAiAuditResult();
   updateReport();
   renderStatsAndHistory();
   setSaveStatus(record ? "已载入" : "新记录");
@@ -788,6 +796,7 @@ function saveCurrent(silent) {
     delete records[selectedDate];
     storeJson(STORAGE_KEYS.records, records);
     renderStatsAndHistory();
+    clearAiAuditResult();
     setSaveStatus("已清空");
     return;
   }
@@ -825,6 +834,7 @@ function saveCurrent(silent) {
   renderQuickFoods();
   const learnedText = learnedCount ? ` · 新增${learnedCount}个快捷食物` : "";
   setSaveStatus(`${silent ? "已保存" : "已覆盖当天记录"}${learnedText}`);
+  queueAiReportAudit();
 }
 
 function setSaveStatus(text) {
@@ -1147,6 +1157,14 @@ function scaleWeightRange(range, factor) {
   return weightRange(range.min * factor, range.max * factor);
 }
 
+function clampValue(value, min, max) {
+  return Math.min(max, Math.max(min, value));
+}
+
+function clampWeightRange(range, min, max) {
+  return weightRange(clampValue(range.min, min, max), clampValue(range.max, min, max));
+}
+
 function normalizeSignedZero(value) {
   return Math.abs(value) < 0.0005 ? 0 : value;
 }
@@ -1162,18 +1180,16 @@ function formatSignedWeightRange(range, precision = 2, unit = "kg", multiplier =
   return `${formatSignedWeight(min, precision)}到${formatSignedWeight(max, precision)}${unit}`;
 }
 
+function formatSignedRange(min, max, precision = 1, unit = "") {
+  const range = weightRange(min, max);
+  return `${formatSignedWeight(range.min, precision)}到${formatSignedWeight(range.max, precision)}${unit}`;
+}
+
 function formatAbsoluteWeightRange(range, precision = 1, unit = "kg") {
   const min = normalizeSignedZero(range.min);
   const max = normalizeSignedZero(range.max);
   if (Math.abs(min - max) < 0.0005) return `${fmt(min, precision)}${unit}`;
   return `${fmt(min, precision)}到${fmt(max, precision)}${unit}`;
-}
-
-function formatFatLossRange(range) {
-  if (range.min >= 0 && range.max >= 0) return "不明显";
-  const low = Math.max(0, -range.max * 1000);
-  const high = Math.max(0, -range.min * 1000);
-  return `${fmt(low, 0)}-${fmt(high, 0)}g`;
 }
 
 function getRecordTotals(record) {
@@ -1239,6 +1255,7 @@ function estimateSodiumWaterRange(sodium) {
 function buildDailyWeightModel(totals, referenceDate = selectedDate) {
   const deficit = profile.tdeeRest - totals.kcal;
   const pureFat = deficit / 7700;
+  const pureFatEquivalentKg = Math.max(0, pureFat);
   const fatLow = Math.max(0, pureFat * 0.75);
   const fatHigh = Math.max(0, pureFat);
   const fatRange =
@@ -1256,6 +1273,7 @@ function buildDailyWeightModel(totals, referenceDate = selectedDate) {
   return {
     deficit,
     pureFat,
+    pureFatEquivalentKg,
     fatRange,
     muscleRange,
     glycogenRange,
@@ -1264,6 +1282,58 @@ function buildDailyWeightModel(totals, referenceDate = selectedDate) {
     gutRange,
     totalRange,
     priorLowCarbDays: glycogenModel.priorLowCarbDays,
+  };
+}
+
+function getRecordsSinceWeightCalibration(recordList) {
+  const calibrationDate = profile.weightCalibratedAt || null;
+  return calibrationDate ? recordList.filter((record) => record.date >= calibrationDate) : recordList;
+}
+
+function buildCumulativeWeightModel(recordList) {
+  return buildCumulativeWeightModelFromEntries(
+    getRecordsSinceWeightCalibration(recordList).map((record) => ({
+      date: record.date,
+      totals: getRecordTotals(record),
+    })),
+  );
+}
+
+function buildCumulativeWeightModelFromEntries(entries) {
+  const sortedEntries = (entries || [])
+    .filter((entry) => entry?.totals)
+    .sort((a, b) => String(a.date || "").localeCompare(String(b.date || "")));
+
+  const result = sortedEntries.reduce(
+    (summary, entry) => {
+      const model = buildDailyWeightModel(entry.totals, entry.date);
+      return {
+        fatRange: sumWeightRanges(summary.fatRange, model.fatRange),
+        muscleRange: sumWeightRanges(summary.muscleRange, model.muscleRange),
+        glycogenWaterRawRange: sumWeightRanges(summary.glycogenWaterRawRange, model.glycogenRange, model.waterRange),
+        transientRange: sumWeightRanges(model.sodiumWaterRange, model.gutRange),
+        dayCount: summary.dayCount + 1,
+      };
+    },
+    {
+      fatRange: weightRange(0, 0),
+      muscleRange: weightRange(0, 0),
+      glycogenWaterRawRange: weightRange(0, 0),
+      transientRange: weightRange(0, 0),
+      dayCount: 0,
+    },
+  );
+
+  const glycogenWaterRange = clampWeightRange(
+    result.glycogenWaterRawRange,
+    CUMULATIVE_GLYCOGEN_WATER_MIN_KG,
+    CUMULATIVE_GLYCOGEN_WATER_MAX_KG,
+  );
+
+  return {
+    ...result,
+    glycogenWaterRange,
+    totalRange: sumWeightRanges(result.fatRange, result.muscleRange, glycogenWaterRange, result.transientRange),
   };
 }
 
@@ -1292,26 +1362,30 @@ function buildWeightEstimateTimeline(currentTotals, referenceDate = selectedDate
 }
 
 function estimateTheoreticalWeight(currentTotals, referenceDate = selectedDate) {
-  const timeline = buildWeightEstimateTimeline(currentTotals, referenceDate);
+  const calibrationDate = profile.weightCalibratedAt || null;
+  const timeline = buildWeightEstimateTimeline(currentTotals, referenceDate).filter(
+    (entry) => !calibrationDate || entry.date >= calibrationDate,
+  );
   let baseWeight = profile.weight;
-  let baseLabel = `设置体重 ${fmt(profile.weight, 1)}kg`;
+  let baseLabel = calibrationDate ? `${calibrationDate} 校准 ${fmt(profile.weight, 1)}kg` : `按设置体重估算 ${fmt(profile.weight, 1)}kg`;
+  let calibrationMode = calibrationDate ? "manual" : "profile-estimate";
   let startIndex = 0;
 
-  const firstWeightedIndex = timeline.findIndex((entry) => typeof entry.weight === "number");
+  const firstWeightedIndex = calibrationDate ? -1 : timeline.findIndex((entry) => typeof entry.weight === "number");
   if (firstWeightedIndex >= 0) {
     baseWeight = timeline[firstWeightedIndex].weight;
     baseLabel = `${timeline[firstWeightedIndex].date} 实测 ${fmt(baseWeight, 1)}kg`;
+    calibrationMode = "recorded-weight";
     startIndex = firstWeightedIndex + 1;
   }
 
-  let changeRange = weightRange(0, 0);
-  for (let index = startIndex; index < timeline.length; index += 1) {
-    changeRange = sumWeightRanges(changeRange, buildDailyWeightModel(timeline[index].totals, timeline[index].date).totalRange);
-  }
+  const changeModel = buildCumulativeWeightModelFromEntries(timeline.slice(startIndex));
+  const changeRange = changeModel.totalRange;
 
   return {
     baseWeight,
     baseLabel,
+    calibrationMode,
     changeRange,
     range: weightRange(baseWeight + changeRange.min, baseWeight + changeRange.max),
   };
@@ -1406,7 +1480,7 @@ function renderWeightSection(totals) {
 
 function renderFinalSection(totals) {
   const weightModel = buildDailyWeightModel(totals, selectedDate);
-  const fatLossText = formatFatLossRange(weightModel.fatRange);
+  const fatChangeText = formatSignedWeightRange(weightModel.fatRange, 0, "g", 1000);
   const scaleText = formatSignedWeightRange(weightModel.totalRange, 2);
   const glycogenReminder =
     weightModel.priorLowCarbDays >= 2
@@ -1423,7 +1497,7 @@ function renderFinalSection(totals) {
 
   return section(
     "最终判断",
-    `<p class="final-call">今天${calorieText}，${proteinText}，${carbText}；理论脂肪减少约${fatLossText}。明天体重更可能变化 ${scaleText}，${glycogenReminder}，所以秤上的变化不等于纯脂肪变化。</p>`,
+    `<p class="final-call">今天${calorieText}，${proteinText}，${carbText}；理论脂肪变化约${fatChangeText}。明天体重更可能变化 ${scaleText}，${glycogenReminder}，所以秤上的变化不等于纯脂肪变化。</p>`,
   );
 }
 
@@ -1447,6 +1521,7 @@ function buildComparisonRows(totals) {
 }
 
 function rangeComparison(label, value, unit, min, max, goodText = "达标") {
+  const precision = unit === "kcal" ? 0 : 1;
   if (value >= min && value <= max) {
     return {
       label,
@@ -1463,7 +1538,7 @@ function rangeComparison(label, value, unit, min, max, goodText = "达标") {
       label,
       intake: valueWithUnit(value, unit),
       target: `${fmt(min, 0)}-${fmt(max, 0)}${unit}`,
-      diff: `-${fmt(min - value, unit === "kcal" ? 0 : 1)}到-${fmt(max - value, unit === "kcal" ? 0 : 1)}${unit}`,
+      diff: formatSignedRange(value - max, value - min, precision, unit),
       judgement: value < min * 0.75 ? "明显不足" : "偏低",
       className: value < min * 0.75 ? "judgement-bad" : "judgement-warn",
     };
@@ -1473,7 +1548,7 @@ function rangeComparison(label, value, unit, min, max, goodText = "达标") {
     label,
     intake: valueWithUnit(value, unit),
     target: `${fmt(min, 0)}-${fmt(max, 0)}${unit}`,
-    diff: `+${fmt(value - max, unit === "kcal" ? 0 : 1)}${unit}`,
+    diff: `+${fmt(value - max, precision)}${unit}`,
     judgement: "偏高",
     className: "judgement-warn",
   };
@@ -1682,6 +1757,7 @@ function generateTargets(source) {
     weight,
     targetWeight,
     processType,
+    weightCalibratedAt: source.weightCalibratedAt || null,
     bmr,
     tdeeRest,
     tdeeLight,
@@ -1728,6 +1804,16 @@ function readProfileForm() {
   };
 }
 
+function attachWeightCalibration(profileForm) {
+  const previousWeight = Number(profile.weight);
+  const nextWeight = Number(profileForm.weight);
+  const weightChanged = Number.isFinite(previousWeight) && Number.isFinite(nextWeight) && Math.abs(previousWeight - nextWeight) >= 0.05;
+  return {
+    ...profileForm,
+    weightCalibratedAt: weightChanged ? selectedDate || todayIso() : profile.weightCalibratedAt || null,
+  };
+}
+
 function renderTargetPreview() {
   const previewProfile = generateTargets(readProfileForm());
   const process = PROCESS_TYPES[previewProfile.processType] || PROCESS_TYPES.muscle_loss;
@@ -1756,7 +1842,11 @@ function syncProfileInputs() {
 }
 
 function saveProfile() {
-  profile = generateTargets(readProfileForm());
+  const profileForm = readProfileForm();
+  const previousWeight = Number(profile.weight);
+  const nextWeight = Number(profileForm.weight);
+  const weightCalibrated = Number.isFinite(previousWeight) && Number.isFinite(nextWeight) && Math.abs(previousWeight - nextWeight) >= 0.05;
+  profile = generateTargets(attachWeightCalibration(profileForm));
   storeJson(STORAGE_KEYS.profile, profile);
   syncProfileInputs();
   renderTargetPreview();
@@ -1767,8 +1857,8 @@ function saveProfile() {
   }
 
   renderStatsAndHistory();
-  showProfileSavedNotice("目标已保存，并已按新目标刷新当天评估");
-  setSaveStatus("目标已保存");
+  showProfileSavedNotice(weightCalibrated ? "当前体重已校准，并已按新目标刷新当天评估" : "目标已保存，并已按新目标刷新当天评估");
+  setSaveStatus(weightCalibrated ? "体重已校准" : "目标已保存");
 }
 
 function resetProfile() {
@@ -1826,6 +1916,7 @@ function copyRecordToSelectedDate(sourceDate) {
 function clearCurrentDay() {
   els.dietText.value = "";
   if (els.dailyWeight) els.dailyWeight.value = "";
+  clearAiAuditResult();
   clearAiImages();
   renderAiAnswer("");
   updateReport();
@@ -2020,6 +2111,212 @@ async function fetchAiInterpretationData(inputText, images, settings) {
   return isChatApi ? extractAiJsonFromChatCompletion(payload) : extractAiJsonFromResponse(payload);
 }
 
+function queueAiReportAudit(delay = 700) {
+  window.clearTimeout(autoAuditTimer);
+  autoAuditTimer = window.setTimeout(() => {
+    runAiReportAudit({ automatic: true });
+  }, delay);
+}
+
+async function runAiReportAudit(options = {}) {
+  const isAutomatic = Boolean(options.automatic);
+  const runId = ++aiAuditRunId;
+  window.clearTimeout(autoAuditTimer);
+  aiSettings = normalizeAiSettings(readAiSettingsForm());
+  storeJson(STORAGE_KEYS.aiSettings, aiSettings);
+  syncAiSettingsInputs();
+
+  const inputText = els.dietText.value.trim();
+  if (!inputText) {
+    if (!isAutomatic) renderAiAuditMessage("请先输入或生成当天饮食记录。", true);
+    return;
+  }
+
+  if (!aiSettings.apiKey) {
+    if (isAutomatic) {
+      renderAiAuditMessage("AI审核待配置：请先在右侧AI补数据里填写API Key。", true);
+    } else {
+      renderAiAuditMessage("请先在右侧AI补数据里填写API Key。", true);
+    }
+    return;
+  }
+
+  updateReport();
+  setAiBusy(true, "AI正在审核报告...");
+  renderAiAuditMessage("AI正在审核本地计算结果...");
+
+  try {
+    const parsed = lastParsed || parseDietText(inputText, foodLibrary);
+    const auditPayload = buildAiAuditPayload(parsed);
+    const auditResult = await fetchAiAuditData(auditPayload, aiSettings);
+    if (runId !== aiAuditRunId) return;
+    renderAiAuditResult(normalizeAiAuditResult(auditResult));
+    setSaveStatus("AI审核完成");
+  } catch (error) {
+    if (runId !== aiAuditRunId) return;
+    const message = error?.message || "AI审核失败";
+    renderAiAuditMessage(message, true);
+    setSaveStatus("AI审核失败");
+  } finally {
+    if (runId === aiAuditRunId) setAiBusy(false);
+  }
+}
+
+async function fetchAiAuditData(auditPayload, settings) {
+  const prompt = buildAiAuditPrompt(auditPayload);
+  const baseUrl = normalizeBaseUrl(settings.baseUrl || DEFAULT_AI_SETTINGS.baseUrl);
+  const isChatApi = settings.apiType === "chat";
+  const requestBody = isChatApi ? buildChatCompletionsRequestBody(prompt, settings, [], "audit") : buildAuditOpenAiRequestBody(prompt, settings);
+  const url = isChatApi ? `${baseUrl}/chat/completions` : `${baseUrl}/responses`;
+  const response = await fetch(url, {
+    method: "POST",
+    headers: buildAiRequestHeaders(settings),
+    body: JSON.stringify(requestBody),
+  });
+
+  const payload = await response.json().catch(() => ({}));
+  if (!response.ok) {
+    const detail = payload?.error?.message || `${response.status} ${response.statusText}`;
+    throw new Error(`AI审核请求失败: ${detail}`);
+  }
+
+  return isChatApi ? extractAiJsonFromChatCompletion(payload) : extractAiJsonFromResponse(payload);
+}
+
+function rangeForAudit(range, multiplier = 1) {
+  return {
+    min: Number((range.min * multiplier).toFixed(3)),
+    max: Number((range.max * multiplier).toFixed(3)),
+  };
+}
+
+function buildAiAuditPayload(parsed) {
+  const totals = parsed.totals;
+  const weightModel = buildDailyWeightModel(totals, selectedDate);
+  const theoreticalWeight = estimateTheoreticalWeight(totals, selectedDate);
+  const macroKcal = totals.protein * 4 + totals.carbs * 4 + totals.fat * 9;
+  const recordList = Object.values(records)
+    .filter((record) => record.rawText)
+    .sort((a, b) => a.date.localeCompare(b.date));
+  const cumulativeModel = buildCumulativeWeightModel(recordList);
+
+  return {
+    date: selectedDate,
+    profile: {
+      age: profile.age,
+      sex: profile.sex,
+      weightKg: profile.weight,
+      targetWeightKg: profile.targetWeight,
+      processType: profile.processType,
+      weightCalibratedAt: profile.weightCalibratedAt || null,
+      bmrKcal: profile.bmr,
+      tdeeRestKcal: profile.tdeeRest,
+      targets: {
+        kcal: [profile.calMin, profile.calMax],
+        proteinG: [profile.proteinMin, profile.proteinMax],
+        carbsG: [profile.carbMin, profile.carbMax],
+        fatG: [profile.fatMin, profile.fatMax],
+        fiberG: [profile.fiberMin, profile.fiberMax],
+        sodiumMaxMg: profile.sodiumMax,
+      },
+    },
+    localReport: {
+      totals,
+      meals: parsed.meals.map((meal) => ({
+        name: meal.name,
+        totals: meal.totals,
+        itemCount: meal.items.length,
+        unmatchedItems: meal.items.filter((item) => !item.matched).map((item) => item.name),
+      })),
+      comparisonRows: buildComparisonRows(totals).map((row) => ({
+        label: row.label,
+        intake: row.intake,
+        target: row.target,
+        diff: row.diff,
+        judgement: row.judgement,
+      })),
+      weightModel: {
+        deficitKcal: Number(weightModel.deficit.toFixed(1)),
+        pureFatKg: Number(weightModel.pureFat.toFixed(4)),
+        pureFatEquivalentKg: Number(weightModel.pureFatEquivalentKg.toFixed(4)),
+        priorLowCarbDays: weightModel.priorLowCarbDays,
+        fatKg: rangeForAudit(weightModel.fatRange),
+        muscleKg: rangeForAudit(weightModel.muscleRange),
+        glycogenKg: rangeForAudit(weightModel.glycogenRange),
+        glycogenWaterKg: rangeForAudit(weightModel.waterRange),
+        sodiumWaterKg: rangeForAudit(weightModel.sodiumWaterRange),
+        gutContentKg: rangeForAudit(weightModel.gutRange),
+        totalWeightKg: rangeForAudit(weightModel.totalRange),
+      },
+      theoreticalWeight: {
+        baseLabel: theoreticalWeight.baseLabel,
+        calibrationMode: theoreticalWeight.calibrationMode,
+        rangeKg: rangeForAudit(theoreticalWeight.range),
+      },
+      cumulativeSinceCalibration: {
+        fatG: rangeForAudit(cumulativeModel.fatRange, 1000),
+        muscleG: rangeForAudit(cumulativeModel.muscleRange, 1000),
+        glycogenWaterRawKg: rangeForAudit(cumulativeModel.glycogenWaterRawRange),
+        glycogenWaterCappedKg: rangeForAudit(cumulativeModel.glycogenWaterRange),
+        latestTransientKg: rangeForAudit(cumulativeModel.transientRange),
+        totalWeightKg: rangeForAudit(cumulativeModel.totalRange),
+        modelNote: "累计总体=累计脂肪+累计肌肉+封顶后的糖原结合水+最近一天钠/肠道短期项；糖原结合水不会按同样幅度每天无限累加。",
+      },
+      macroEnergyCheck: {
+        macroKcal: Number(macroKcal.toFixed(1)),
+        kcalDiff: Number((macroKcal - totals.kcal).toFixed(1)),
+        kcalDiffPct: totals.kcal ? Number((((macroKcal - totals.kcal) / totals.kcal) * 100).toFixed(1)) : null,
+        tolerancePct: 5,
+      },
+    },
+    modelRules: {
+      comparisonDiff: "负数区间按从小到大显示，例如 -574到-444kcal。",
+      fatChange: "fatKg 使用负值表示脂肪减少；pureFatEquivalentKg 仅表示热量缺口对应的纯脂肪等价正值。",
+      glycogenWaterCumulativeCapKg: [CUMULATIVE_GLYCOGEN_WATER_MIN_KG, CUMULATIVE_GLYCOGEN_WATER_MAX_KG],
+      transientWeight: "钠相关水分和肠道内容物只作为最近一天短期体重项，不做长期线性累计。",
+      calibration: "手动修改基础目标里的当前体重即视为当天体重校准；无校准时理论体重只按设置体重估算。",
+    },
+    auditRules: [
+      "AI只审核和指出疑点，不要直接覆盖本地结果。",
+      "优先检查数学符号、单位、区间方向、脂肪变化是否用负值表示减少。",
+      "重点检查糖原和糖原结合水是否遵守累计封顶，不应连续多日线性放大。",
+      "宏量营养素热量交叉校验允许约5%以内的食物库和四舍五入误差。",
+      "如果只是模型不确定或区间很宽，标记为需注意；只有明显矛盾或算术错误才标记疑似错误。",
+    ],
+  };
+}
+
+function buildAiAuditPrompt(auditPayload) {
+  return `你是饮食报告计算审核员。请审核下面这份由本地规则生成的营养和体重报告。
+
+要求：
+1. 不要重新自由创作报告，只审核本地计算结果是否有明显错误、矛盾或需要注意的地方。
+2. 重点检查单位、正负号、区间方向、热量缺口换算脂肪、蛋白不足时肌肉变化、糖原结合水是否连续过度累计、钠和水分方向是否矛盾。
+3. 已知规则：糖原结合水累计已有封顶，钠相关水分和肠道内容物只按最近一天短期项处理；宏量营养热量交叉校验允许约5%以内误差。
+4. 如果发现问题，给出建议参考值或修正规则；但不要声称已经替用户修改。
+5. 只返回 JSON，不要 Markdown，不要解释性前后缀。
+
+返回格式：
+{
+  "status": "通过/需注意/疑似错误",
+  "summary": "一句话总结审核结果",
+  "findings": [
+    {
+      "severity": "info/warning/error",
+      "area": "问题所在模块",
+      "localValue": "本地显示或计算值",
+      "issue": "为什么可能有问题",
+      "suggestion": "建议怎么处理",
+      "suggestedValue": "可选，建议参考值或为空"
+    }
+  ],
+  "recommendedAction": "仅提示/建议复核规则/建议修正食物营养/建议人工确认"
+}
+
+本地报告数据：
+${JSON.stringify(auditPayload, null, 2)}`;
+}
+
 function buildUnifiedAiPrompt(inputText) {
   const knownFoods = buildKnownFoodPromptList();
   const recentContext = buildRecentRecordPromptContext();
@@ -2169,6 +2466,70 @@ function renderAiAnswer(answer) {
 
   els.aiAnswerBox.textContent = answer;
   els.aiAnswerBox.classList.remove("hidden");
+}
+
+function normalizeAiAuditResult(result) {
+  const allowedStatuses = ["通过", "需注意", "疑似错误"];
+  const status = allowedStatuses.includes(result?.status) ? result.status : "需注意";
+  const findings = Array.isArray(result?.findings) ? result.findings : [];
+
+  return {
+    status,
+    summary: String(result?.summary || "AI已完成审核，但没有返回摘要。").trim(),
+    recommendedAction: String(result?.recommendedAction || "仅提示").trim(),
+    findings: findings.slice(0, 6).map((finding) => ({
+      severity: ["info", "warning", "error"].includes(finding?.severity) ? finding.severity : "warning",
+      area: String(finding?.area || "未指明模块").trim(),
+      localValue: String(finding?.localValue || "").trim(),
+      issue: String(finding?.issue || "未说明原因").trim(),
+      suggestion: String(finding?.suggestion || "建议人工复核").trim(),
+      suggestedValue: String(finding?.suggestedValue || "").trim(),
+    })),
+  };
+}
+
+function renderAiAuditMessage(message, isError = false) {
+  els.aiAuditBox.className = `ai-audit-box ${isError ? "audit-error" : "audit-loading"}`;
+  els.aiAuditBox.textContent = message;
+  els.aiAuditBox.classList.remove("hidden");
+}
+
+function clearAiAuditResult() {
+  if (!els.aiAuditBox) return;
+  window.clearTimeout(autoAuditTimer);
+  aiAuditRunId += 1;
+  els.aiAuditBox.classList.add("hidden");
+  els.aiAuditBox.innerHTML = "";
+}
+
+function renderAiAuditResult(audit) {
+  const statusClass =
+    audit.status === "通过" ? "audit-pass" : audit.status === "疑似错误" ? "audit-error" : "audit-warning";
+  const findingsHtml = audit.findings.length
+    ? audit.findings
+        .map(
+          (finding) => `
+            <li class="audit-finding ${escapeHtml(finding.severity)}">
+              <strong>${escapeHtml(finding.area)}</strong>
+              ${finding.localValue ? `<span>本地值: ${escapeHtml(finding.localValue)}</span>` : ""}
+              <p>${escapeHtml(finding.issue)}</p>
+              <em>${escapeHtml(finding.suggestion)}${finding.suggestedValue ? ` 参考: ${escapeHtml(finding.suggestedValue)}` : ""}</em>
+            </li>
+          `,
+        )
+        .join("")
+    : `<li class="audit-finding info"><strong>未发现明显问题</strong><p>AI没有列出需要处理的疑点。</p></li>`;
+
+  els.aiAuditBox.className = `ai-audit-box ${statusClass}`;
+  els.aiAuditBox.innerHTML = `
+    <div class="audit-title">
+      <strong>AI审核：${escapeHtml(audit.status)}</strong>
+      <span>${escapeHtml(audit.recommendedAction)}</span>
+    </div>
+    <p>${escapeHtml(audit.summary)}</p>
+    <ul>${findingsHtml}</ul>
+  `;
+  els.aiAuditBox.classList.remove("hidden");
 }
 
 function getAiInterpretCacheKey(inputText, images) {
@@ -2649,7 +3010,9 @@ function buildChatCompletionsRequestBody(prompt, settings, imageDataUrls = [], m
         content:
           mode === "unified"
             ? "你是饮食记录和营养分析助手。你可以解读文字和图片，必须只输出 JSON，不要输出 Markdown。涉及体重变化估算时，要对糖原和糖原结合水保持保守，不能假定它们每天都能持续按同样幅度下降。"
-            : "你是营养数据估算助手。你必须谨慎估算食物营养数据，不确定时说明假设。只输出 JSON，不要输出 Markdown。",
+            : mode === "audit"
+              ? "你是饮食报告计算审核员。你只审核本地规则结果，指出疑点和建议，不要直接覆盖本地数值。必须只输出 JSON，不要输出 Markdown。"
+              : "你是营养数据估算助手。你必须谨慎估算食物营养数据，不确定时说明假设。只输出 JSON，不要输出 Markdown。",
       },
       {
         role: "user",
@@ -2745,6 +3108,57 @@ function buildOpenAiRequestBody(prompt, settings) {
   }
 
   return body;
+}
+
+function buildAuditOpenAiRequestBody(prompt, settings) {
+  return {
+    model: settings.model || DEFAULT_AI_SETTINGS.model,
+    temperature: 0,
+    input: [
+      {
+        role: "system",
+        content:
+          "你是饮食报告计算审核员。你只审核本地规则结果，指出疑点和建议，不要直接覆盖本地数值。必须只输出符合 schema 的 JSON。",
+      },
+      {
+        role: "user",
+        content: prompt,
+      },
+    ],
+    text: {
+      format: {
+        type: "json_schema",
+        name: "nutrition_report_audit",
+        schema: {
+          type: "object",
+          additionalProperties: false,
+          required: ["status", "summary", "findings", "recommendedAction"],
+          properties: {
+            status: { type: "string", enum: ["通过", "需注意", "疑似错误"] },
+            summary: { type: "string" },
+            findings: {
+              type: "array",
+              items: {
+                type: "object",
+                additionalProperties: false,
+                required: ["severity", "area", "localValue", "issue", "suggestion", "suggestedValue"],
+                properties: {
+                  severity: { type: "string", enum: ["info", "warning", "error"] },
+                  area: { type: "string" },
+                  localValue: { type: "string" },
+                  issue: { type: "string" },
+                  suggestion: { type: "string" },
+                  suggestedValue: { type: "string" },
+                },
+              },
+            },
+            recommendedAction: { type: "string" },
+          },
+        },
+        strict: true,
+      },
+    },
+  };
 }
 
 function buildUnifiedOpenAiRequestBody(prompt, settings, imageDataUrls = []) {
@@ -3115,12 +3529,16 @@ function renderStatsAndHistory() {
   ).length;
   const weights = recordList.map((record) => getUsableRecordedWeight(record.weight)).filter((weight) => typeof weight === "number");
   const weightChange = weights.length >= 2 ? weights[weights.length - 1] - weights[0] : null;
+  const cumulativeModel = buildCumulativeWeightModel(recordList);
 
   els.statsGrid.innerHTML = [
     statCard("记录天数", `${dayCount}天`),
     statCard("平均热量", dayCount ? `${fmt(average.kcal, 0)} kcal` : "-"),
     statCard("平均蛋白", dayCount ? `${fmt(average.protein, 1)}g` : "-"),
     statCard("体重变化", weightChange === null ? "-" : `${weightChange >= 0 ? "+" : ""}${fmt(weightChange, 1)}kg`),
+    statCard("累计脂肪", dayCount ? formatSignedWeightRange(cumulativeModel.fatRange, 0, "g", 1000) : "-"),
+    statCard("累计肌肉", dayCount ? formatSignedWeightRange(cumulativeModel.muscleRange, 0, "g", 1000) : "-"),
+    statCard("累计总体", dayCount ? formatSignedWeightRange(cumulativeModel.totalRange, 2) : "-"),
     statCard("达标天数", dayCount ? `${targetDays}/${dayCount}` : "-"),
     statCard("最近记录", dayCount ? recordList[recordList.length - 1].date : "-"),
   ].join("");
@@ -3140,9 +3558,9 @@ function renderTodayStats(totals = null) {
     targetGapRow("碳水", currentTotals.carbs, "g", profile.carbMin, profile.carbMax, 1),
     sodiumGapRow(currentTotals.sodium),
     {
-      label: "脂肪减",
+      label: "脂肪变",
       intake: "按今天热量",
-      gap: weightModel.deficit > 0 ? formatFatLossRange(weightModel.fatRange) : "不明显",
+      gap: formatSignedWeightRange(weightModel.fatRange, 0, "g", 1000),
       className: weightModel.deficit > 0 ? "ok" : "under",
     },
     {
@@ -3159,7 +3577,7 @@ function renderTodayStats(totals = null) {
     },
     {
       label: "理论体重",
-      intake: `基于${theoreticalWeight.baseLabel}`,
+      intake: theoreticalWeight.calibrationMode === "profile-estimate" ? theoreticalWeight.baseLabel : `基于${theoreticalWeight.baseLabel}`,
       gap: formatAbsoluteWeightRange(theoreticalWeight.range, 1),
       className: "ok",
     },
