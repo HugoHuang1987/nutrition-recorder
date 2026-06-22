@@ -63,6 +63,15 @@ const TURING_AI_PRESET = {
   useWebSearch: false,
 };
 
+const GENERIC_FOOD_ALIAS_TERMS = new Set(["牛奶"]);
+const PACKAGED_NUTRIENT_RULES = [
+  { key: "kcal", label: "热量", names: ["热量", "能量", "kcal", "千卡"], unitPattern: "(?:kcal|千卡)" },
+  { key: "protein", label: "蛋白", names: ["蛋白质", "蛋白"], unitPattern: "(?:g|克)" },
+  { key: "carbs", label: "碳水", names: ["碳水化合物", "碳水"], unitPattern: "(?:g|克)" },
+  { key: "fat", label: "脂肪", names: ["脂肪"], unitPattern: "(?:g|克)" },
+  { key: "fiber", label: "纤维", names: ["膳食纤维", "纤维"], unitPattern: "(?:g|克)" },
+  { key: "sodium", label: "钠", names: ["钠"], unitPattern: "(?:mg|毫克)" },
+];
 const CUMULATIVE_GLYCOGEN_WATER_MIN_KG = -0.8;
 const CUMULATIVE_GLYCOGEN_WATER_MAX_KG = 0.3;
 
@@ -896,6 +905,7 @@ function parseFoodLine(line, foods) {
 
 function findFood(line, foods) {
   const normalLine = normalizeText(line);
+  const inferredKey = normalizeText(inferName(line));
   let best = null;
   let bestScore = 0;
 
@@ -903,6 +913,9 @@ function findFood(line, foods) {
     [food.name, ...(food.aliases || [])].forEach((term) => {
       const normalTerm = normalizeText(term);
       if (!normalTerm || !normalLine.includes(normalTerm)) return;
+      if (isOverGenericAliasMatch(line, inferredKey, normalTerm, food)) return;
+      if (isNutrientDescriptorAliasMatch(line, normalTerm, food)) return;
+      if (packagedNutritionDiffersFromFood(line, food)) return;
       const score = normalTerm.length * 10 - normalLine.indexOf(normalTerm);
       if (score > bestScore) {
         best = food;
@@ -912,6 +925,96 @@ function findFood(line, foods) {
   });
 
   return best;
+}
+
+function isOverGenericAliasMatch(line, inferredKey, normalTerm, food) {
+  if (!GENERIC_FOOD_ALIAS_TERMS.has(normalTerm)) return false;
+  if (extractPackagedNutritionFacts(line) && inferredKey === normalTerm) return true;
+  if (!inferredKey || inferredKey === normalTerm || inferredKey === normalizeText(food.name)) return false;
+  return inferredKey.includes(normalTerm);
+}
+
+function isNutrientDescriptorAliasMatch(line, normalTerm, food) {
+  if (normalTerm !== "蛋白" || food.id !== "egg-white") return false;
+  return Boolean(extractPackagedNutritionFacts(line)?.values.protein);
+}
+
+function extractPackagedNutritionFacts(text) {
+  const rawText = String(text || "");
+  const servingUnitMatch = rawText.match(/(?:[\/／]\s*100\s*(ml|毫升|g|克)|每\s*100\s*(ml|毫升|g|克))/i);
+  if (!servingUnitMatch) return null;
+
+  const servingUnit = normalizeUnit(servingUnitMatch[1] || servingUnitMatch[2]);
+  const values = {};
+
+  PACKAGED_NUTRIENT_RULES.forEach((rule) => {
+    const namePattern = rule.names.join("|");
+    const patterns = [
+      new RegExp(`(?:${namePattern})\\D{0,10}(\\d+(?:\\.\\d+)?)\\s*${rule.unitPattern}\\s*[\/／]\\s*100\\s*(?:ml|毫升|g|克)`, "i"),
+      new RegExp(`(\\d+(?:\\.\\d+)?)\\s*${rule.unitPattern}\\s*[\/／]\\s*100\\s*(?:ml|毫升|g|克)\\s*(?:${namePattern})`, "i"),
+      new RegExp(`每\\s*100\\s*(?:ml|毫升|g|克)\\D{0,18}(?:${namePattern})\\D{0,10}(\\d+(?:\\.\\d+)?)\\s*${rule.unitPattern}`, "i"),
+    ];
+    const match = patterns.map((pattern) => rawText.match(pattern)).find(Boolean);
+    const value = match ? Number(match[1]) : null;
+    if (Number.isFinite(value) && value >= 0) values[rule.key] = value;
+  });
+
+  return Object.keys(values).length ? { unit: servingUnit, values } : null;
+}
+
+function packagedNutritionDiffersFromFood(line, food) {
+  const facts = extractPackagedNutritionFacts(line);
+  if (!facts || !food || food.needsNutrition) return false;
+  let compared = false;
+
+  const differs = Object.entries(facts.values).some(([key, value]) => {
+    const knownValue = foodNutrientPer100(food, key, facts.unit);
+    if (knownValue === null) return false;
+    compared = true;
+    return Math.abs(value - knownValue) > nutrientDifferenceTolerance(key, knownValue);
+  });
+  return differs || !compared;
+}
+
+function foodNutrientPer100(food, key, unit) {
+  if (!food || food.unit !== unit || !Number(food.qty)) return null;
+  const value = Number(food.nutrients?.[key]);
+  if (!Number.isFinite(value)) return null;
+  return (value * 100) / Number(food.qty);
+}
+
+function nutrientDifferenceTolerance(key, knownValue) {
+  if (key === "kcal") return Math.max(5, Math.abs(knownValue) * 0.08);
+  if (["sodium", "calcium", "potassium", "magnesium"].includes(key)) return Math.max(5, Math.abs(knownValue) * 0.15);
+  return Math.max(0.3, Math.abs(knownValue) * 0.08);
+}
+
+function formatPackagedNutritionVariantName(baseName, facts) {
+  if (!facts) return baseName;
+  const preferredKeys = ["protein", "kcal", "carbs", "fat", "fiber", "sodium"];
+  const key = preferredKeys.find((item) => facts.values[item] !== undefined);
+  const rule = PACKAGED_NUTRIENT_RULES.find((item) => item.key === key);
+  if (!rule) return baseName;
+  const value = facts.values[key];
+  const precision = Number.isInteger(value) ? 0 : 1;
+  const unit = key === "kcal" ? "kcal" : key === "sodium" ? "mg" : "g";
+  const servingUnitText = facts.unit === "ml" ? "100ml" : "100g";
+  return `${baseName}${rule.label}${fmt(value, precision)}${unit}每${servingUnitText}`;
+}
+
+function normalizedTextUsesConflictingKnownFood(originalText, normalizedText) {
+  if (!extractPackagedNutritionFacts(originalText) || !String(normalizedText || "").trim()) return false;
+  const parsed = parseDietText(normalizedText, foodLibrary);
+  return parsed.meals.some((meal) =>
+    meal.items.some((item) => {
+      const food = item.foodId ? foodLibrary.find((candidate) => candidate.id === item.foodId) : null;
+      return food && packagedNutritionDiffersFromFood(originalText, food);
+    }),
+  );
+}
+
+function hasExplicitPackagedNutritionVariant(text) {
+  return Boolean(extractPackagedNutritionFacts(text));
 }
 
 function extractAmount(line, food) {
@@ -988,11 +1091,14 @@ function parseAmountNumber(value) {
 }
 
 function inferName(line) {
-  return line
+  const baseName = line
     .replace(/^\s*(?:[-*•]|[0-9０-９]+[\s.、)）-]*)\s*/, "")
     .split(/[，,、\s]/)[0]
     .replace(/(?:\d+(?:\.\d+)?|[一二两三四五六七八九十半]+)(?:千克|公斤|kg|KG|克|g|G|毫升|ml|ML|mL|个|颗|根|盒|份|勺|片|条|碗|杯|罐|袋|只)/g, "")
     .trim();
+  const facts = extractPackagedNutritionFacts(line);
+  if (facts) return formatPackagedNutritionVariantName(baseName, facts);
+  return baseName;
 }
 
 function detectMealHeader(line) {
@@ -2142,7 +2248,11 @@ async function runAiReportAudit(options = {}) {
   }
 
   updateReport();
-  setAiBusy(true, "AI正在审核报告...");
+  if (isAutomatic) {
+    setAiConfigStatus("AI正在审核报告...");
+  } else {
+    setAiBusy(true, "AI正在审核报告...");
+  }
   renderAiAuditMessage("AI正在审核本地计算结果...");
 
   try {
@@ -2158,7 +2268,7 @@ async function runAiReportAudit(options = {}) {
     renderAiAuditMessage(message, true);
     setSaveStatus("AI审核失败");
   } finally {
-    if (runId === aiAuditRunId) setAiBusy(false);
+    if (!isAutomatic && runId === aiAuditRunId) setAiBusy(false);
   }
 }
 
@@ -2340,10 +2450,11 @@ function buildUnifiedAiPrompt(inputText) {
 2. 如果用户是在问问题，请在 answer 中直接回答。
 3. 如果识别出本工具可能没有的新食物、包装食品、图片里的食物，给出 foods 营养数据估算。营养数据必须是“默认份量”的数据，不是只给每100g。dataSource 写“AI估算”，confidence 为 high/medium/low，note 写明假设。
 4. 不确定食物重量时，请用常见份量保守估计，并在 note 或 answer 里说明。
-5. 稳定性规则：相同输入要给出相同 normalizedDietText；不要随意改食物名；优先使用“已知食物库”的名称。
-6. 已知食物库里已有的食物，不要在 foods 里重复估算营养；foods 只放未知食物或包装/图片里需要新增的数据。
-7. 只返回 JSON，不要 Markdown，不要解释性前后缀。
-8. 如果你需要回答“今天会瘦多少”“明天体重会怎么变”“最近为什么掉得快或不掉”等体重变化问题，必须把糖原和糖原结合水当作有限的短期波动来源，不能默认它们每天都能继续按同样幅度下降。若最近几天碳水已连续偏低，后续糖原和结合水的下降幅度要明显收窄；同时要一起考虑脂肪、钠、水分、肠道内容物和训练恢复。
+5. 稳定性规则：相同输入要给出相同 normalizedDietText；不要随意改食物名；优先使用“已知食物库”的名称，但用户提供了包装营养值或明确品类差异时例外。
+6. 已知食物库里已有的食物，不要在 foods 里重复估算营养；foods 只放未知食物或包装/图片里需要新增的数据。注意：如果用户输入的是更具体的品牌/品类/配方，例如低脂牛奶、高钙牛奶、脱脂牛奶、某品牌牛奶，即使库里已有“牛奶/全脂牛奶”，也要把这个具体名称当作新食物补充 foods。
+7. 如果用户给出了任何食物的包装营养差异，例如“蛋白3.6g/100ml”“每100g热量250kcal”“脂肪10g/100g”，不要归并到已知食物，也不要只回答“略有差异”。必须在 normalizedDietText 使用可区分的新名称，例如“牛奶蛋白3.6g每100ml，200ml”或“面包热量250kcal每100g，100g”，并在 foods 中新增同名食物。serving 用对应的 100ml 或 100g，nutrition 至少填入用户给出的营养值，其余营养按包装或合理估算填写。如果你无法判断是否同一种食物，在 answer 中提示需要确认，但不要擅自合并到旧食物。
+8. 只返回 JSON，不要 Markdown，不要解释性前后缀。
+9. 如果你需要回答“今天会瘦多少”“明天体重会怎么变”“最近为什么掉得快或不掉”等体重变化问题，必须把糖原和糖原结合水当作有限的短期波动来源，不能默认它们每天都能继续按同样幅度下降。若最近几天碳水已连续偏低，后续糖原和结合水的下降幅度要明显收窄；同时要一起考虑脂肪、钠、水分、肠道内容物和训练恢复。
 
 当前日期：${selectedDate}
 当前目标：热量 ${profile.calMin}-${profile.calMax} kcal；蛋白 ${profile.proteinMin}-${profile.proteinMax}g；碳水 ${profile.carbMin}-${profile.carbMax}g；脂肪 ${profile.fatMin}-${profile.fatMax}g；钠 <${profile.sodiumMax}mg。
@@ -2439,6 +2550,10 @@ function stabilizeUnifiedAiResult(result, originalText) {
   const normalizedItemCount = normalizedParsed.meals.reduce((sum, meal) => sum + meal.items.length, 0);
 
   if (!normalizedItemCount && originalItemCount) {
+    stable.normalizedDietText = originalText;
+  }
+
+  if (hasExplicitPackagedNutritionVariant(originalText) && normalizedTextUsesConflictingKnownFood(originalText, stable.normalizedDietText)) {
     stable.normalizedDietText = originalText;
   }
 
@@ -3556,6 +3671,7 @@ function renderTodayStats(totals = null) {
     targetGapRow("蛋白", currentTotals.protein, "g", profile.proteinMin, profile.proteinMax, 1),
     targetGapRow("脂肪", currentTotals.fat, "g", profile.fatMin, profile.fatMax, 1),
     targetGapRow("碳水", currentTotals.carbs, "g", profile.carbMin, profile.carbMax, 1),
+    targetGapRow("纤维", currentTotals.fiber, "g", profile.fiberMin, profile.fiberMax, 1),
     sodiumGapRow(currentTotals.sodium),
     {
       label: "脂肪变",
