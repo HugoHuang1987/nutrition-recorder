@@ -72,6 +72,23 @@ const PACKAGED_NUTRIENT_RULES = [
   { key: "fiber", label: "纤维", names: ["膳食纤维", "纤维"], unitPattern: "(?:g|克)" },
   { key: "sodium", label: "钠", names: ["钠"], unitPattern: "(?:mg|毫克)" },
 ];
+const WATER_STATUS_OPTIONS = {
+  normal: {
+    label: "正常",
+    range: [0, 0],
+    note: "未记录额外水分因素，不额外增加总体重上限",
+  },
+  retention: {
+    label: "偏水肿/回补",
+    range: [0.1, 0.6],
+    note: "明确记录水肿、高碳回补、训练酸痛或睡眠压力等因素时使用",
+  },
+  depleted: {
+    label: "偏脱水/排空",
+    range: [-0.4, 0],
+    note: "明确记录大量出汗、脱水、腹泻或排空较多时使用",
+  },
+};
 const CUMULATIVE_GLYCOGEN_WATER_MIN_KG = -0.8;
 const CUMULATIVE_GLYCOGEN_WATER_MAX_KG = 0.3;
 
@@ -86,7 +103,7 @@ const PROCESS_TYPES = {
     fatMax: 0.75,
     carbFloor: 100,
     minBmrFactor: 0.95,
-    note: "优先保肌，热量缺口温和，蛋白质更高。",
+    note: "优先保肌，久坐缺口温和，蛋白质更高。",
   },
   steady_loss: {
     label: "稳步减重",
@@ -616,6 +633,7 @@ let aiInputImages = [];
 const els = {
   recordDate: document.getElementById("recordDate"),
   dailyWeight: document.getElementById("dailyWeight"),
+  waterStatus: document.getElementById("waterStatus"),
   jumpTodayBtn: document.getElementById("jumpTodayBtn"),
   saveStatus: document.getElementById("saveStatus"),
   saveBtn: document.getElementById("saveBtn"),
@@ -713,6 +731,13 @@ function bindEvents() {
     });
   }
 
+  if (els.waterStatus) {
+    els.waterStatus.addEventListener("change", () => {
+      updateReport();
+      setSaveStatus("待AI解读并保存");
+    });
+  }
+
   els.dietText.addEventListener("input", () => {
     clearAiAuditResult();
     updateReport();
@@ -777,6 +802,7 @@ function loadSelectedRecord() {
   if (els.recordDate) els.recordDate.value = selectedDate;
   els.dietText.value = record?.rawText || "";
   if (els.dailyWeight) els.dailyWeight.value = record?.weight || "";
+  if (els.waterStatus) els.waterStatus.value = normalizeWaterStatus(record?.waterStatus);
   clearAiAuditResult();
   updateReport();
   renderStatsAndHistory();
@@ -800,6 +826,7 @@ function saveCurrent(silent) {
   const rawText = els.dietText.value.trim();
   const currentRecord = records[selectedDate];
   const weight = getUsableRecordedWeight(els.dailyWeight ? numberOrNull(els.dailyWeight.value) : currentRecord?.weight ?? null);
+  const waterStatus = normalizeWaterStatus(els.waterStatus?.value || currentRecord?.waterStatus);
 
   if (!rawText) {
     delete records[selectedDate];
@@ -821,6 +848,7 @@ function saveCurrent(silent) {
     date: selectedDate,
     rawText,
     weight,
+    waterStatus,
     totals: parsed.totals,
     meals: parsed.meals.map((meal) => ({
       name: meal.name,
@@ -1286,6 +1314,13 @@ function formatSignedWeightRange(range, precision = 2, unit = "kg", multiplier =
   return `${formatSignedWeight(min, precision)}到${formatSignedWeight(max, precision)}${unit}`;
 }
 
+function formatWaterWeightRange(range) {
+  const min = normalizeSignedZero(range.min);
+  const max = normalizeSignedZero(range.max);
+  if (min === 0 && max === 0) return "0kg";
+  return formatSignedWeightRange(range, 2);
+}
+
 function formatSignedRange(min, max, precision = 1, unit = "") {
   const range = weightRange(min, max);
   return `${formatSignedWeight(range.min, precision)}到${formatSignedWeight(range.max, precision)}${unit}`;
@@ -1354,8 +1389,22 @@ function estimateGlycogenRange(totals, referenceDate = selectedDate) {
 
 function estimateSodiumWaterRange(sodium) {
   if (sodium > profile.sodiumMax) return weightRange(0.1, 0.5);
-  if (sodium < 1500) return weightRange(-0.1, 0.1);
-  return weightRange(-0.05, 0.2);
+  if (sodium < 1500) return weightRange(-0.15, 0);
+  return weightRange(-0.05, 0);
+}
+
+function normalizeWaterStatus(status) {
+  return WATER_STATUS_OPTIONS[status] ? status : "normal";
+}
+
+function getWaterStatusForDate(referenceDate = selectedDate) {
+  if (referenceDate === selectedDate && els.waterStatus) return normalizeWaterStatus(els.waterStatus.value);
+  return normalizeWaterStatus(records[referenceDate]?.waterStatus);
+}
+
+function estimateManualWaterRange(status) {
+  const option = WATER_STATUS_OPTIONS[normalizeWaterStatus(status)];
+  return weightRange(option.range[0], option.range[1]);
 }
 
 function buildDailyWeightModel(totals, referenceDate = selectedDate) {
@@ -1372,9 +1421,11 @@ function buildDailyWeightModel(totals, referenceDate = selectedDate) {
   const glycogenRange = glycogenModel.range;
   const waterRange = scaleWeightRange(glycogenRange, 3);
   const sodiumWaterRange = estimateSodiumWaterRange(totals.sodium);
+  const waterStatus = getWaterStatusForDate(referenceDate);
+  const manualWaterRange = estimateManualWaterRange(waterStatus);
   const gutRange =
     totals.fiber < profile.fiberMin || totals.kcal < profile.calMin ? weightRange(-0.3, -0.1) : weightRange(-0.1, 0.1);
-  const totalRange = sumWeightRanges(fatRange, muscleRange, glycogenRange, waterRange, sodiumWaterRange, gutRange);
+  const totalRange = sumWeightRanges(fatRange, muscleRange, glycogenRange, waterRange, sodiumWaterRange, manualWaterRange, gutRange);
 
   return {
     deficit,
@@ -1385,6 +1436,8 @@ function buildDailyWeightModel(totals, referenceDate = selectedDate) {
     glycogenRange,
     waterRange,
     sodiumWaterRange,
+    manualWaterRange,
+    waterStatus,
     gutRange,
     totalRange,
     priorLowCarbDays: glycogenModel.priorLowCarbDays,
@@ -1417,7 +1470,7 @@ function buildCumulativeWeightModelFromEntries(entries) {
         fatRange: sumWeightRanges(summary.fatRange, model.fatRange),
         muscleRange: sumWeightRanges(summary.muscleRange, model.muscleRange),
         glycogenWaterRawRange: sumWeightRanges(summary.glycogenWaterRawRange, model.glycogenRange, model.waterRange),
-        transientRange: sumWeightRanges(model.sodiumWaterRange, model.gutRange),
+        transientRange: sumWeightRanges(model.sodiumWaterRange, model.manualWaterRange, model.gutRange),
         dayCount: summary.dayCount + 1,
       };
     },
@@ -1526,13 +1579,13 @@ function renderWeightSection(totals) {
 
   const componentRows = [
     [
-      "脂肪",
-      `约 ${formatSignedWeightRange(weightModel.fatRange, 2)}`,
-      weightModel.deficit > 0 ? "热量缺口越大，脂肪动员占比越高" : "热量没有形成缺口，脂肪下降不明显",
+      "脂肪变",
+      `约 ${formatSignedWeightRange(weightModel.fatRange, 0, "g", 1000)}`,
+      weightModel.deficit > 0 ? "久坐缺口越大，脂肪动员占比越高" : "久坐缺口没有形成，脂肪下降不明显",
     ],
     [
-      "肌肉组织",
-      `约 ${formatSignedWeightRange(weightModel.muscleRange, 2)}`,
+      "肌肉变",
+      `约 ${formatSignedWeightRange(weightModel.muscleRange, 0, "g", 1000)}`,
       totals.protein >= profile.proteinMin ? "蛋白质达标时，短期肌肉损失风险较低" : "蛋白质不足时，保肌压力会上升",
     ],
     [
@@ -1551,6 +1604,11 @@ function renderWeightSection(totals) {
       "钠、饮水和出汗会让第二天体重出现短期偏移",
     ],
     [
+      "额外水分状态",
+      `约 ${formatWaterWeightRange(weightModel.manualWaterRange)}`,
+      WATER_STATUS_OPTIONS[weightModel.waterStatus].note,
+    ],
+    [
       "肠道内容物",
       `约 ${formatSignedWeightRange(weightModel.gutRange, 1)}`,
       "进食总量、纤维和排空节奏都会影响秤上数字",
@@ -1558,8 +1616,8 @@ function renderWeightSection(totals) {
   ];
 
   const tomorrowRows = [
-    ["只看脂肪", weightModel.deficit > 0 ? `约 ${formatSignedWeightRange(weightModel.fatRange, 2)}` : "变化不明显"],
-    ["综合体重变化", `约 ${formatSignedWeightRange(weightModel.totalRange, 2)}`],
+    ["脂肪变", weightModel.deficit > 0 ? `约 ${formatSignedWeightRange(weightModel.fatRange, 0, "g", 1000)}` : "变化不明显"],
+    ["总体重", `约 ${formatSignedWeightRange(weightModel.totalRange, 2)}`],
     ["糖原结合水提醒", weightModel.priorLowCarbDays >= 2 ? "近期已连续低碳，后续糖原和水分下降空间会变小" : "如果刚开始低碳，前两天的秤重波动通常更明显"],
   ];
 
@@ -1572,10 +1630,10 @@ function renderWeightSection(totals) {
         [
           ["今日摄入", `约${fmt(totals.kcal, 0)} kcal`],
           ["久坐日消耗", `约${fmt(profile.tdeeRest, 0)} kcal`],
-          ["理论热量缺口", `${weightModel.deficit >= 0 ? "约" : "约+"}${fmt(Math.abs(weightModel.deficit), 0)} kcal`],
+          ["久坐缺口", `约${formatEnergyDeficit(weightModel.deficit)}`],
         ],
       )}
-      <p>如果把全部热量缺口都按脂肪估算: <strong>${fmt(Math.abs(weightModel.deficit), 0)} ÷ 7700 ≈ ${fmt(Math.abs(weightModel.pureFat), 3)}kg脂肪</strong>。</p>
+      <p>如果把久坐缺口全部按脂肪估算: <strong>${fmt(Math.abs(weightModel.deficit), 0)} ÷ 7700 ≈ ${fmt(Math.abs(weightModel.pureFat), 3)}kg脂肪</strong>。</p>
       <p>更现实的拆分估算:</p>
       ${table(["组成", "今日理论变化", "解释"], componentRows)}
       <h3>明天体重可能变化</h3>
@@ -1603,14 +1661,14 @@ function renderFinalSection(totals) {
 
   return section(
     "最终判断",
-    `<p class="final-call">今天${calorieText}，${proteinText}，${carbText}；理论脂肪变化约${fatChangeText}。明天体重更可能变化 ${scaleText}，${glycogenReminder}，所以秤上的变化不等于纯脂肪变化。</p>`,
+    `<p class="final-call">今天${calorieText}，${proteinText}，${carbText}；脂肪变约${fatChangeText}。明天总体重更可能变化 ${scaleText}，${glycogenReminder}，所以秤上的变化不等于纯脂肪变化。</p>`,
   );
 }
 
 function buildComparisonRows(totals) {
   return [
     exactComparison("热量 vs 基础代谢", totals.kcal, "kcal", profile.bmr, "基础代谢", 0, true),
-    rangeComparison("热量 vs 久坐减脂目标", totals.kcal, "kcal", profile.calMin, profile.calMax),
+    rangeComparison("热量目标", totals.kcal, "kcal", profile.calMin, profile.calMax),
     rangeComparison("蛋白质", totals.protein, "g", profile.proteinMin, profile.proteinMax, "很好"),
     rangeComparison("碳水", totals.carbs, "g", profile.carbMin, profile.carbMax),
     rangeComparison("脂肪", totals.fat, "g", profile.fatMin, profile.fatMax, "合适"),
@@ -2015,6 +2073,7 @@ function copyRecordToSelectedDate(sourceDate) {
 
   els.dietText.value = source.rawText || "";
   if (els.dailyWeight) els.dailyWeight.value = source.weight || "";
+  if (els.waterStatus) els.waterStatus.value = normalizeWaterStatus(source.waterStatus);
   updateReport();
   setSaveStatus(`已复制 ${sourceDate}，待AI解读并保存`);
 }
@@ -2022,6 +2081,7 @@ function copyRecordToSelectedDate(sourceDate) {
 function clearCurrentDay() {
   els.dietText.value = "";
   if (els.dailyWeight) els.dailyWeight.value = "";
+  if (els.waterStatus) els.waterStatus.value = "normal";
   clearAiAuditResult();
   clearAiImages();
   renderAiAnswer("");
@@ -2355,6 +2415,8 @@ function buildAiAuditPayload(parsed) {
         glycogenKg: rangeForAudit(weightModel.glycogenRange),
         glycogenWaterKg: rangeForAudit(weightModel.waterRange),
         sodiumWaterKg: rangeForAudit(weightModel.sodiumWaterRange),
+        manualWaterStatus: weightModel.waterStatus,
+        manualWaterKg: rangeForAudit(weightModel.manualWaterRange),
         gutContentKg: rangeForAudit(weightModel.gutRange),
         totalWeightKg: rangeForAudit(weightModel.totalRange),
       },
@@ -2381,14 +2443,14 @@ function buildAiAuditPayload(parsed) {
     },
     modelRules: {
       comparisonDiff: "负数区间按从小到大显示，例如 -574到-444kcal。",
-      fatChange: "fatKg 使用负值表示脂肪减少；pureFatEquivalentKg 仅表示热量缺口对应的纯脂肪等价正值。",
+      fatChange: "fatKg 是脂肪变，用负值表示减少；pureFatEquivalentKg 仅表示久坐缺口对应的纯脂肪等价正值。",
       glycogenWaterCumulativeCapKg: [CUMULATIVE_GLYCOGEN_WATER_MIN_KG, CUMULATIVE_GLYCOGEN_WATER_MAX_KG],
-      transientWeight: "钠相关水分和肠道内容物只作为最近一天短期体重项，不做长期线性累计。",
+      transientWeight: "钠相关水分、手动水分状态和肠道内容物只作为最近一天短期体重项，不做长期线性累计；钠未超标时，钠相关水分不提供正向上限；只有手动水分状态为 retention 时，额外水分才提供正向上限。",
       calibration: "手动修改基础目标里的当前体重即视为当天体重校准；无校准时理论体重只按设置体重估算。",
     },
     auditRules: [
       "AI只审核和指出疑点，不要直接覆盖本地结果。",
-      "优先检查数学符号、单位、区间方向、脂肪变化是否用负值表示减少。",
+      "优先检查数学符号、单位、区间方向、脂肪变是否用负值表示减少。",
       "重点检查糖原和糖原结合水是否遵守累计封顶，不应连续多日线性放大。",
       "宏量营养素热量交叉校验允许约5%以内的食物库和四舍五入误差。",
       "如果只是模型不确定或区间很宽，标记为需注意；只有明显矛盾或算术错误才标记疑似错误。",
@@ -2401,8 +2463,8 @@ function buildAiAuditPrompt(auditPayload) {
 
 要求：
 1. 不要重新自由创作报告，只审核本地计算结果是否有明显错误、矛盾或需要注意的地方。
-2. 重点检查单位、正负号、区间方向、热量缺口换算脂肪、蛋白不足时肌肉变化、糖原结合水是否连续过度累计、钠和水分方向是否矛盾。
-3. 已知规则：糖原结合水累计已有封顶，钠相关水分和肠道内容物只按最近一天短期项处理；宏量营养热量交叉校验允许约5%以内误差。
+2. 重点检查单位、正负号、区间方向、久坐缺口换算脂肪、蛋白质不足时肌肉变、糖原结合水是否连续过度累计、钠和水分方向是否矛盾。
+3. 已知规则：糖原结合水累计已有封顶，钠相关水分、手动水分状态和肠道内容物只按最近一天短期项处理；钠未超标时，钠相关水分不提供正向上限；只有手动水分状态为 retention 时，额外水分才提供正向上限；宏量营养热量交叉校验允许约5%以内误差。
 4. 如果发现问题，给出建议参考值或修正规则；但不要声称已经替用户修改。
 5. 只返回 JSON，不要 Markdown，不要解释性前后缀。
 
@@ -2457,7 +2519,7 @@ function buildUnifiedAiPrompt(inputText) {
 9. 如果你需要回答“今天会瘦多少”“明天体重会怎么变”“最近为什么掉得快或不掉”等体重变化问题，必须把糖原和糖原结合水当作有限的短期波动来源，不能默认它们每天都能继续按同样幅度下降。若最近几天碳水已连续偏低，后续糖原和结合水的下降幅度要明显收窄；同时要一起考虑脂肪、钠、水分、肠道内容物和训练恢复。
 
 当前日期：${selectedDate}
-当前目标：热量 ${profile.calMin}-${profile.calMax} kcal；蛋白 ${profile.proteinMin}-${profile.proteinMax}g；碳水 ${profile.carbMin}-${profile.carbMax}g；脂肪 ${profile.fatMin}-${profile.fatMax}g；钠 <${profile.sodiumMax}mg。
+当前目标：热量 ${profile.calMin}-${profile.calMax} kcal；蛋白质 ${profile.proteinMin}-${profile.proteinMax}g；碳水 ${profile.carbMin}-${profile.carbMax}g；脂肪 ${profile.fatMin}-${profile.fatMax}g；钠 <${profile.sodiumMax}mg。
 到昨天为止的连续低碳天数：${priorLowCarbDays} 天。
 最近已保存记录：
 ${recentContext}
@@ -3649,7 +3711,7 @@ function renderStatsAndHistory() {
   els.statsGrid.innerHTML = [
     statCard("记录天数", `${dayCount}天`),
     statCard("平均热量", dayCount ? `${fmt(average.kcal, 0)} kcal` : "-"),
-    statCard("平均蛋白", dayCount ? `${fmt(average.protein, 1)}g` : "-"),
+    statCard("平均蛋白质", dayCount ? `${fmt(average.protein, 1)}g` : "-"),
     statCard("体重变化", weightChange === null ? "-" : `${weightChange >= 0 ? "+" : ""}${fmt(weightChange, 1)}kg`),
     statCard("累计脂肪", dayCount ? formatSignedWeightRange(cumulativeModel.fatRange, 0, "g", 1000) : "-"),
     statCard("累计肌肉", dayCount ? formatSignedWeightRange(cumulativeModel.muscleRange, 0, "g", 1000) : "-"),
@@ -3667,11 +3729,12 @@ function renderTodayStats(totals = null) {
   const weightModel = buildDailyWeightModel(currentTotals, selectedDate);
   const theoreticalWeight = estimateTheoreticalWeight(currentTotals, selectedDate);
   const rows = [
-    targetGapRow("热量", currentTotals.kcal, "kcal", profile.calMin, profile.calMax, 0),
-    targetGapRow("蛋白", currentTotals.protein, "g", profile.proteinMin, profile.proteinMax, 1),
+    targetGapRow("热量目标", currentTotals.kcal, "kcal", profile.calMin, profile.calMax, 0),
+    energyDeficitRow(weightModel.deficit),
+    targetGapRow("蛋白质", currentTotals.protein, "g", profile.proteinMin, profile.proteinMax, 1),
     targetGapRow("脂肪", currentTotals.fat, "g", profile.fatMin, profile.fatMax, 1),
     targetGapRow("碳水", currentTotals.carbs, "g", profile.carbMin, profile.carbMax, 1),
-    targetGapRow("纤维", currentTotals.fiber, "g", profile.fiberMin, profile.fiberMax, 1),
+    targetGapRow("膳食纤维", currentTotals.fiber, "g", profile.fiberMin, profile.fiberMax, 1),
     sodiumGapRow(currentTotals.sodium),
     {
       label: "脂肪变",
@@ -3681,13 +3744,19 @@ function renderTodayStats(totals = null) {
     },
     {
       label: "肌肉变",
-      intake: currentTotals.protein >= profile.proteinMin ? "蛋白达标" : "蛋白偏低",
+      intake: currentTotals.protein >= profile.proteinMin ? "蛋白质达标" : "蛋白质偏低",
       gap: formatSignedWeightRange(weightModel.muscleRange, 0, "g", 1000),
       className: currentTotals.protein >= profile.proteinMin ? "ok" : "under",
     },
     {
+      label: "额外水分",
+      intake: WATER_STATUS_OPTIONS[weightModel.waterStatus].label,
+      gap: formatWaterWeightRange(weightModel.manualWaterRange),
+      className: weightModel.waterStatus === "retention" ? "over" : weightModel.waterStatus === "depleted" ? "under" : "ok",
+    },
+    {
       label: "总体重",
-      intake: "含糖原水分",
+      intake: "含水分状态/肠道",
       gap: formatSignedWeightRange(weightModel.totalRange, 2),
       className: "ok",
     },
@@ -3719,7 +3788,7 @@ function targetGapRow(label, value, unit, min, max, precision) {
   let gap = "达标";
   let className = "ok";
   if (value < min) {
-    gap = `-${fmt(min - value, precision)}${unit}`;
+    gap = formatSignedRange(value - max, value - min, precision, unit);
     className = "under";
   } else if (value > max) {
     gap = `+${fmt(value - max, precision)}${unit}`;
@@ -3731,6 +3800,21 @@ function targetGapRow(label, value, unit, min, max, precision) {
     intake: `${fmt(value, precision)}${unit} / ${fmt(min, precision)}-${fmt(max, precision)}${unit}`,
     gap,
     className,
+  };
+}
+
+function formatEnergyDeficit(deficit) {
+  const safeDeficit = normalizeSignedZero(deficit);
+  return `${safeDeficit >= 0 ? "+" : "-"}${fmt(Math.abs(safeDeficit), 0)}kcal`;
+}
+
+function energyDeficitRow(deficit) {
+  const intakeKcal = profile.tdeeRest - deficit;
+  return {
+    label: "久坐缺口",
+    intake: `${fmt(intakeKcal, 0)}kcal / ${fmt(profile.tdeeRest, 0)}kcal`,
+    gap: formatEnergyDeficit(deficit),
+    className: deficit >= 0 ? "ok" : "over",
   };
 }
 
@@ -3783,7 +3867,7 @@ function renderHistory(recordList) {
         <div class="history-item ${record.date === selectedDate ? "active" : ""}">
           <button class="history-open" data-date="${record.date}" type="button">
             <strong>${record.date}</strong>
-            <span>${fmt(totals.kcal, 0)} kcal · 蛋白 ${fmt(totals.protein, 1)}g</span>
+            <span>${fmt(totals.kcal, 0)} kcal · 蛋白质 ${fmt(totals.protein, 1)}g</span>
           </button>
           <button class="history-copy" data-copy-date="${record.date}" type="button" title="复制到当前日期">复制</button>
         </div>

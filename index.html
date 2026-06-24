@@ -65,6 +65,14 @@
             <label class="btn file-btn" for="aiImageInput">上传图片</label>
             <input id="aiImageInput" class="hidden" type="file" accept="image/*" multiple />
             <button id="clearImagesBtn" class="btn" type="button">清除图片</button>
+            <label class="field compact water-status-field">
+              <span>水分状态</span>
+              <select id="waterStatus">
+                <option value="normal">正常</option>
+                <option value="retention">偏水肿/回补</option>
+                <option value="depleted">偏脱水/排空</option>
+              </select>
+            </label>
             <span id="aiInputStatus" class="ai-input-status">文字、食物清单、营养问题或图片都可以直接发给AI。</span>
           </div>
           <div id="imagePreviewList" class="image-preview-list"></div>
