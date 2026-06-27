@@ -887,23 +887,26 @@ function parseDietText(text, foods) {
   let currentMeal = meals[0];
   const unmatched = [];
 
-  text
+  const lines = text
     .split(/\r?\n/)
     .map((line) => line.trim())
-    .forEach((line) => {
-      if (!line) return;
-      const mealName = detectMealHeader(line);
-      if (mealName) {
-        currentMeal = meals.find((meal) => meal.name === mealName) || meals[0];
-        return;
-      }
+    .filter(Boolean);
 
-      const item = parseFoodLine(line, foods);
-      if (!item.name) return;
-      currentMeal.items.push(item);
-      currentMeal.totals = addNutrients(currentMeal.totals, item.nutrients);
-      if (!item.matched) unmatched.push(item.raw);
-    });
+  lines.forEach((sourceLine, index) => {
+    const line = stripBoundaryDateCue(sourceLine, index === 0, index === lines.length - 1);
+    if (!line) return;
+    const mealName = detectMealHeader(line);
+    if (mealName) {
+      currentMeal = meals.find((meal) => meal.name === mealName) || meals[0];
+      return;
+    }
+
+    const item = parseFoodLine(line, foods);
+    if (!item.name) return;
+    currentMeal.items.push(item);
+    currentMeal.totals = addNutrients(currentMeal.totals, item.nutrients);
+    if (!item.matched) unmatched.push(item.raw);
+  });
 
   const totals = meals.reduce((result, meal) => addNutrients(result, meal.totals), emptyNutrients());
   return { meals, totals, unmatched };
@@ -2236,14 +2239,22 @@ async function runUnifiedAiInterpretation() {
       setAiInputStatus("使用上次稳定解读结果...");
     } else {
       result = await fetchAiInterpretationData(inputText, aiInputImages, aiSettings);
-      result = stabilizeUnifiedAiResult(result, inputText);
-      setCachedAiInterpretation(cacheKey, result);
-      if (result.normalizedDietText) {
-        setCachedAiInterpretation(getAiInterpretCacheKey(result.normalizedDietText, []), result);
-      }
     }
-    applyUnifiedAiResult(result);
-    setAiInputStatus("AI已解读并覆盖当天记录");
+    result = stabilizeUnifiedAiResult(result, inputText);
+    setCachedAiInterpretation(cacheKey, result);
+    if (result.normalizedDietText) {
+      const normalizedContextDate = result.recordDate || selectedDate;
+      setCachedAiInterpretation(getAiInterpretCacheKey(result.normalizedDietText, [], normalizedContextDate), {
+        ...result,
+        recordDate: "",
+      });
+    }
+    const outcome = applyUnifiedAiResult(result);
+    setAiInputStatus(
+      outcome.savedDate
+        ? `AI已解读并保存至 ${outcome.savedDate}${outcome.replacedExisting ? "（已更新原记录）" : ""}`
+        : "AI已完成解读",
+    );
   } catch (error) {
     const message = error?.message || "AI解读失败";
     setAiInputStatus(message, true);
@@ -2493,6 +2504,7 @@ function buildUnifiedAiPrompt(inputText) {
   const knownFoods = buildKnownFoodPromptList();
   const recentContext = buildRecentRecordPromptContext();
   const priorLowCarbDays = countPriorLowCarbStreak(selectedDate);
+  const localDateHint = detectLocalRecordDate(inputText, todayIso());
   return `你是我的饮食记录和营养分析助手。请解读用户输入的文字和/或图片。
 
 你要完成：
@@ -2517,8 +2529,11 @@ function buildUnifiedAiPrompt(inputText) {
 7. 如果用户给出了任何食物的包装营养差异，例如“蛋白3.6g/100ml”“每100g热量250kcal”“脂肪10g/100g”，不要归并到已知食物，也不要只回答“略有差异”。必须在 normalizedDietText 使用可区分的新名称，例如“牛奶蛋白3.6g每100ml，200ml”或“面包热量250kcal每100g，100g”，并在 foods 中新增同名食物。serving 用对应的 100ml 或 100g，nutrition 至少填入用户给出的营养值，其余营养按包装或合理估算填写。如果你无法判断是否同一种食物，在 answer 中提示需要确认，但不要擅自合并到旧食物。
 8. 只返回 JSON，不要 Markdown，不要解释性前后缀。
 9. 如果你需要回答“今天会瘦多少”“明天体重会怎么变”“最近为什么掉得快或不掉”等体重变化问题，必须把糖原和糖原结合水当作有限的短期波动来源，不能默认它们每天都能继续按同样幅度下降。若最近几天碳水已连续偏低，后续糖原和结合水的下降幅度要明显收窄；同时要一起考虑脂肪、钠、水分、肠道内容物和训练恢复。
+10. 用户可以把记录日期写在整段三餐的开头或结尾，例如“昨天”“前天”“上周三”“2026年6月25日”“6月25号”。请将明确或可合理判断的日期换算成 YYYY-MM-DD，填入 recordDate，并从 normalizedDietText 中删除日期说明。相对日期必须以“系统今天”为基准；如果用户没有指定日期，recordDate 必须返回空字符串，不要自行猜测。
 
-当前日期：${selectedDate}
+系统今天：${todayIso()}
+当前页面日期：${selectedDate}
+本地日期初步识别：${localDateHint || "未识别，由你判断是否存在模糊日期表达"}
 当前目标：热量 ${profile.calMin}-${profile.calMax} kcal；蛋白质 ${profile.proteinMin}-${profile.proteinMax}g；碳水 ${profile.carbMin}-${profile.carbMax}g；脂肪 ${profile.fatMin}-${profile.fatMax}g；钠 <${profile.sodiumMax}mg。
 到昨天为止的连续低碳天数：${priorLowCarbDays} 天。
 最近已保存记录：
@@ -2529,6 +2544,7 @@ ${knownFoods}
 返回格式：
 {
   "answer": "给用户看的简明回答，可以为空",
+  "recordDate": "用户指定的记录日期，格式为YYYY-MM-DD；没有指定就为空字符串",
   "normalizedDietText": "整理后的三餐文本；如果没有饮食记录内容就为空字符串",
   "foods": [
     {
@@ -2583,10 +2599,23 @@ function applyUnifiedAiResult(result) {
   }
 
   const normalizedDietText = String(result?.normalizedDietText || "").trim();
+  const targetDate = normalizeRecordDate(result?.recordDate) || selectedDate;
+  const targetRecord = records[targetDate];
+  const dateChanged = targetDate !== selectedDate;
+  let savedDate = "";
+  let replacedExisting = false;
   if (normalizedDietText) {
+    selectedDate = targetDate;
+    if (els.recordDate) els.recordDate.value = selectedDate;
+    if (dateChanged) {
+      if (els.dailyWeight) els.dailyWeight.value = targetRecord?.weight || "";
+      if (els.waterStatus) els.waterStatus.value = normalizeWaterStatus(targetRecord?.waterStatus);
+    }
     els.dietText.value = normalizedDietText;
     updateReport();
+    replacedExisting = Boolean(targetRecord?.rawText);
     saveCurrent(false);
+    savedDate = selectedDate;
   } else if (changedIds.length) {
     recalculateRecordsForFoodIds(changedIds);
     updateReport();
@@ -2597,11 +2626,15 @@ function applyUnifiedAiResult(result) {
   if (!normalizedDietText && !answer && !changedIds.length) {
     renderAiAnswer("AI没有返回可用内容。你可以换一种说法，或把图片拍得更清楚一点。");
   }
+
+  return { savedDate, replacedExisting };
 }
 
 function stabilizeUnifiedAiResult(result, originalText) {
+  const localRecordDate = detectLocalRecordDate(originalText, todayIso());
   const stable = {
     answer: String(result?.answer || "").trim(),
+    recordDate: localRecordDate || normalizeRecordDate(result?.recordDate) || "",
     normalizedDietText: String(result?.normalizedDietText || "").trim(),
     foods: Array.isArray(result?.foods) ? result.foods : [],
   };
@@ -2618,6 +2651,8 @@ function stabilizeUnifiedAiResult(result, originalText) {
   if (hasExplicitPackagedNutritionVariant(originalText) && normalizedTextUsesConflictingKnownFood(originalText, stable.normalizedDietText)) {
     stable.normalizedDietText = originalText;
   }
+
+  stable.normalizedDietText = stripRecordDateCueFromText(stable.normalizedDietText);
 
   stable.foods = stable.foods
     .map((item) => ({
@@ -2709,9 +2744,9 @@ function renderAiAuditResult(audit) {
   els.aiAuditBox.classList.remove("hidden");
 }
 
-function getAiInterpretCacheKey(inputText, images) {
+function getAiInterpretCacheKey(inputText, images, contextDate = selectedDate) {
   const imageSignature = (images || []).map((image) => image.dataUrl).join("|");
-  return hashString([selectedDate, inputText || "", imageSignature].join("\n---\n"));
+  return hashString(["date-routing-v1", todayIso(), contextDate, inputText || "", imageSignature].join("\n---\n"));
 }
 
 function getCachedAiInterpretation(cacheKey) {
@@ -3186,7 +3221,7 @@ function buildChatCompletionsRequestBody(prompt, settings, imageDataUrls = [], m
         role: "system",
         content:
           mode === "unified"
-            ? "你是饮食记录和营养分析助手。你可以解读文字和图片，必须只输出 JSON，不要输出 Markdown。涉及体重变化估算时，要对糖原和糖原结合水保持保守，不能假定它们每天都能持续按同样幅度下降。"
+            ? "你是饮食记录和营养分析助手。你可以解读文字和图片，也要识别用户写在三餐开头或结尾的记录日期。必须只输出 JSON，不要输出 Markdown。涉及体重变化估算时，要对糖原和糖原结合水保持保守，不能假定它们每天都能持续按同样幅度下降。"
             : mode === "audit"
               ? "你是饮食报告计算审核员。你只审核本地规则结果，指出疑点和建议，不要直接覆盖本地数值。必须只输出 JSON，不要输出 Markdown。"
               : "你是营养数据估算助手。你必须谨慎估算食物营养数据，不确定时说明假设。只输出 JSON，不要输出 Markdown。",
@@ -3354,7 +3389,7 @@ function buildUnifiedOpenAiRequestBody(prompt, settings, imageDataUrls = []) {
       {
         role: "system",
         content:
-          "你是饮食记录和营养分析助手。你可以解读文字和图片，必须只输出符合 schema 的 JSON。涉及体重变化估算时，要对糖原和糖原结合水保持保守，不能假定它们每天都能持续按同样幅度下降。",
+          "你是饮食记录和营养分析助手。你可以解读文字和图片，也要识别用户写在三餐开头或结尾的记录日期。必须只输出符合 schema 的 JSON。涉及体重变化估算时，要对糖原和糖原结合水保持保守，不能假定它们每天都能持续按同样幅度下降。",
       },
       {
         role: "user",
@@ -3368,9 +3403,10 @@ function buildUnifiedOpenAiRequestBody(prompt, settings, imageDataUrls = []) {
         schema: {
           type: "object",
           additionalProperties: false,
-          required: ["answer", "normalizedDietText", "foods"],
+          required: ["answer", "recordDate", "normalizedDietText", "foods"],
           properties: {
             answer: { type: "string" },
+            recordDate: { type: "string" },
             normalizedDietText: { type: "string" },
             foods: {
               type: "array",
@@ -4051,6 +4087,98 @@ function dateToLocalNoon(value) {
   const [year, month, day] = String(value).slice(0, 10).split("-").map(Number);
   if (!year || !month || !day) return null;
   return new Date(year, month - 1, day, 12);
+}
+
+function detectLocalRecordDate(text, referenceDate = todayIso()) {
+  const lines = String(text || "")
+    .split(/\r?\n/)
+    .map((line) => line.trim())
+    .filter(Boolean);
+  if (!lines.length) return "";
+
+  const boundaryLines = lines.length === 1 ? lines : [lines[0], lines[lines.length - 1]];
+  for (const line of boundaryLines) {
+    const fullDate =
+      line.match(
+        /^(?:(?:记录日期|日期|记录到|记到|记在|算在|写在)\s*[：:为是]?\s*)?(20\d{2})\s*[年./-]\s*(\d{1,2})\s*[月./-]\s*(\d{1,2})\s*[日号]?/,
+      ) ||
+      line.match(
+        /(?:(?:记录日期|日期|记录到|记到|记在|算在|写在)\s*[：:为是]?\s*)?(20\d{2})\s*[年./-]\s*(\d{1,2})\s*[月./-]\s*(\d{1,2})\s*[日号]?(?:的)?(?:饮食|三餐|记录)?[。.]?$/,
+      );
+    if (fullDate) {
+      const date = makeIsoDate(Number(fullDate[1]), Number(fullDate[2]), Number(fullDate[3]));
+      if (date) return date;
+    }
+
+    const monthDay =
+      line.match(
+        /^(?:(?:记录日期|日期|记录到|记到|记在|算在|写在)\s*[：:为是]?\s*)?(\d{1,2})\s*月\s*(\d{1,2})\s*[日号]/,
+      ) ||
+      line.match(
+        /(?:(?:记录日期|日期|记录到|记到|记在|算在|写在)\s*[：:为是]?\s*)?(\d{1,2})\s*月\s*(\d{1,2})\s*[日号](?:的)?(?:饮食|三餐|记录)?[。.]?$/,
+      );
+    if (monthDay) {
+      const reference = dateToLocalNoon(referenceDate);
+      const date = reference && makeIsoDate(reference.getFullYear(), Number(monthDay[1]), Number(monthDay[2]));
+      if (date) return date;
+    }
+
+    const relativeMatch = line.match(
+      /^(?:(?:记录日期|日期|记录到|记到|记在|算在|写在)\s*[：:为是]?\s*)?(大前天|前天|昨天|昨日|今天|今日|明天|后天)(?=$|[的：:,，\s]|早餐|午餐|晚餐|加餐)/,
+    ) || line.match(/(大前天|前天|昨天|昨日|今天|今日|明天|后天)(?:的)?(?:饮食|三餐|记录)?[。.]?$/);
+    if (relativeMatch) {
+      const offsets = { 大前天: -3, 前天: -2, 昨天: -1, 昨日: -1, 今天: 0, 今日: 0, 明天: 1, 后天: 2 };
+      return addDaysIso(referenceDate, offsets[relativeMatch[1]] || 0);
+    }
+  }
+
+  return "";
+}
+
+function stripBoundaryDateCue(line, isFirstLine, isLastLine) {
+  let value = String(line || "").trim();
+  const dateToken = "(?:20\\d{2}\\s*[年./-]\\s*\\d{1,2}\\s*[月./-]\\s*\\d{1,2}\\s*[日号]?|\\d{1,2}\\s*月\\s*\\d{1,2}\\s*[日号]|大前天|前天|昨天|昨日|今天|今日|明天|后天)";
+  const label = "(?:(?:记录日期|日期|记录到|记到|记在|算在|写在)\\s*[：:为是]?\\s*)?";
+
+  if (isFirstLine) {
+    value = value.replace(new RegExp(`^${label}${dateToken}(?:的)?(?:饮食|三餐|记录)?[：:,，\\s-]*`), "").trim();
+  }
+  if (isLastLine) {
+    value = value
+      .replace(new RegExp(`[，,\\s-]*${label}${dateToken}(?:的)?(?:饮食|三餐|记录)?[。.]?$`), "")
+      .trim();
+  }
+  return value;
+}
+
+function stripRecordDateCueFromText(text) {
+  const lines = String(text || "").split(/\r?\n/);
+  const nonEmptyIndexes = lines.map((line, index) => (line.trim() ? index : -1)).filter((index) => index >= 0);
+  if (!nonEmptyIndexes.length) return "";
+  const firstIndex = nonEmptyIndexes[0];
+  const lastIndex = nonEmptyIndexes[nonEmptyIndexes.length - 1];
+  return lines
+    .map((line, index) => stripBoundaryDateCue(line, index === firstIndex, index === lastIndex))
+    .join("\n")
+    .trim();
+}
+
+function normalizeRecordDate(value) {
+  const match = String(value || "").trim().match(/^(20\d{2})-(\d{2})-(\d{2})$/);
+  return match ? makeIsoDate(Number(match[1]), Number(match[2]), Number(match[3])) : "";
+}
+
+function makeIsoDate(year, month, day) {
+  const date = new Date(year, month - 1, day, 12);
+  if (date.getFullYear() !== year || date.getMonth() !== month - 1 || date.getDate() !== day) return "";
+  return `${year}-${String(month).padStart(2, "0")}-${String(day).padStart(2, "0")}`;
+}
+
+function addDaysIso(value, offset) {
+  const date = dateToLocalNoon(value);
+  if (!date) return "";
+  date.setDate(date.getDate() + Number(offset || 0));
+  return makeIsoDate(date.getFullYear(), date.getMonth() + 1, date.getDate());
 }
 
 function numberOrNull(value) {
