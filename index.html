@@ -62,8 +62,10 @@
           <textarea id="dietText" spellcheck="false"></textarea>
 
           <div class="input-tools">
-            <label class="btn file-btn" for="aiImageInput">上传图片</label>
+            <label class="btn file-btn" for="aiImageInput" title="选择餐食、菜单或营养成分图片">添加图片</label>
             <input id="aiImageInput" class="hidden" type="file" accept="image/*" multiple />
+            <label class="btn file-btn" for="aiCameraInput" title="使用手机后置摄像头拍摄">拍照</label>
+            <input id="aiCameraInput" class="hidden" type="file" accept="image/*" capture="environment" />
             <button id="clearImagesBtn" class="btn" type="button">清除图片</button>
             <label class="field compact water-status-field">
               <span>水分状态</span>
@@ -73,7 +75,7 @@
                 <option value="depleted">偏脱水/排空</option>
               </select>
             </label>
-            <span id="aiInputStatus" class="ai-input-status">文字、食物清单、营养问题或图片都可以直接发给AI。</span>
+            <span id="aiInputStatus" class="ai-input-status">可结合文字添加餐食、菜单或营养图片。</span>
           </div>
           <div id="imagePreviewList" class="image-preview-list"></div>
 

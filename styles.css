@@ -337,12 +337,39 @@ textarea {
   width: 96px;
 }
 
+.image-preview-frame {
+  position: relative;
+  width: 96px;
+  height: 72px;
+}
+
 .image-preview img {
   width: 96px;
   height: 72px;
   object-fit: cover;
   border: 1px solid var(--line);
   border-radius: 8px;
+}
+
+.image-remove {
+  position: absolute;
+  top: 4px;
+  right: 4px;
+  display: grid;
+  place-items: center;
+  width: 24px;
+  height: 24px;
+  padding: 0;
+  border: 1px solid rgba(255, 255, 255, 0.85);
+  border-radius: 50%;
+  background: rgba(24, 24, 27, 0.78);
+  color: #fff;
+  font-size: 18px;
+  line-height: 1;
+}
+
+.image-remove:hover {
+  background: #18181b;
 }
 
 .image-preview span {
@@ -1059,6 +1086,16 @@ summary {
 
   .top-controls {
     justify-content: stretch;
+  }
+
+  .editor-panel > .panel-header {
+    display: grid;
+    grid-template-columns: 1fr;
+    align-items: start;
+  }
+
+  .editor-panel > .panel-header .button-row {
+    justify-content: flex-start;
   }
 
   .field.compact,

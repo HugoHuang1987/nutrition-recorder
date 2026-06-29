@@ -647,6 +647,7 @@ const els = {
   editorPanel: document.querySelector(".editor-panel"),
   dropOverlay: document.getElementById("dropOverlay"),
   aiImageInput: document.getElementById("aiImageInput"),
+  aiCameraInput: document.getElementById("aiCameraInput"),
   clearImagesBtn: document.getElementById("clearImagesBtn"),
   aiInputStatus: document.getElementById("aiInputStatus"),
   imagePreviewList: document.getElementById("imagePreviewList"),
@@ -756,7 +757,9 @@ function bindEvents() {
   els.interpretAiBtn.addEventListener("click", runUnifiedAiInterpretation);
   els.copyInputBtn.addEventListener("click", copyAiInput);
   els.aiImageInput.addEventListener("change", handleAiImageInput);
+  if (els.aiCameraInput) els.aiCameraInput.addEventListener("change", handleAiCameraInput);
   els.clearImagesBtn.addEventListener("click", clearAiImages);
+  els.imagePreviewList.addEventListener("click", handleImagePreviewClick);
   els.editorPanel.addEventListener("paste", handleEditorPaste);
   els.editorPanel.addEventListener("dragenter", handleEditorDragEnter);
   els.editorPanel.addEventListener("dragover", handleEditorDragOver);
@@ -2107,6 +2110,12 @@ function handleAiImageInput(event) {
   event.target.value = "";
 }
 
+function handleAiCameraInput(event) {
+  const files = Array.from(event.target.files || []).filter((file) => file.type.startsWith("image/"));
+  addAiImageFiles(files, "拍照");
+  event.target.value = "";
+}
+
 function handleEditorPaste(event) {
   const files = extractImageFilesFromClipboard(event.clipboardData);
   if (!files.length) return;
@@ -2192,9 +2201,12 @@ function renderImagePreviews() {
 
   els.imagePreviewList.innerHTML = aiInputImages
     .map(
-      (image) => `
+      (image, index) => `
         <div class="image-preview">
-          <img src="${image.dataUrl}" alt="${escapeHtml(image.name)}">
+          <div class="image-preview-frame">
+            <img src="${image.dataUrl}" alt="${escapeHtml(image.name)}">
+            <button class="image-remove" data-image-index="${index}" type="button" title="移除这张图片" aria-label="移除${escapeHtml(image.name)}">×</button>
+          </div>
           <span>${escapeHtml(image.name)}</span>
         </div>
       `,
@@ -2202,10 +2214,20 @@ function renderImagePreviews() {
     .join("");
 }
 
+function handleImagePreviewClick(event) {
+  const button = event.target.closest("[data-image-index]");
+  if (!button) return;
+  const index = Number(button.dataset.imageIndex);
+  if (!Number.isInteger(index) || index < 0 || index >= aiInputImages.length) return;
+  aiInputImages.splice(index, 1);
+  renderImagePreviews();
+  setAiInputStatus(aiInputImages.length ? `已附加${aiInputImages.length}张图片` : "图片已移除");
+}
+
 function clearAiImages() {
   aiInputImages = [];
   renderImagePreviews();
-  setAiInputStatus("文字、食物清单、营养问题或图片都可以直接发给AI。");
+  setAiInputStatus("可结合文字添加餐食、菜单或营养图片。");
 }
 
 function setAiInputStatus(message, isError = false) {
@@ -2265,7 +2287,7 @@ async function runUnifiedAiInterpretation() {
 }
 
 async function fetchAiInterpretationData(inputText, images, settings) {
-  const prompt = buildUnifiedAiPrompt(inputText);
+  const prompt = buildUnifiedAiPrompt(inputText, images);
   const imageDataUrls = images.map((image) => image.dataUrl);
   const baseUrl = normalizeBaseUrl(settings.baseUrl || DEFAULT_AI_SETTINGS.baseUrl);
   const isChatApi = settings.apiType === "chat";
@@ -2500,11 +2522,14 @@ function buildAiAuditPrompt(auditPayload) {
 ${JSON.stringify(auditPayload, null, 2)}`;
 }
 
-function buildUnifiedAiPrompt(inputText) {
+function buildUnifiedAiPrompt(inputText, images = []) {
   const knownFoods = buildKnownFoodPromptList();
   const recentContext = buildRecentRecordPromptContext();
   const priorLowCarbDays = countPriorLowCarbStreak(selectedDate);
   const localDateHint = detectLocalRecordDate(inputText, todayIso());
+  const imageContext = images.length
+    ? images.map((image, index) => `图${index + 1}：${image.name || "未命名图片"}`).join("\n")
+    : "无图片";
   return `你是我的饮食记录和营养分析助手。请解读用户输入的文字和/或图片。
 
 你要完成：
@@ -2521,19 +2546,27 @@ function buildUnifiedAiPrompt(inputText) {
 加餐:
 1 食物名，数量单位
 
-2. 如果用户是在问问题，请在 answer 中直接回答。
-3. 如果识别出本工具可能没有的新食物、包装食品、图片里的食物，给出 foods 营养数据估算。营养数据必须是“默认份量”的数据，不是只给每100g。dataSource 写“AI估算”，confidence 为 high/medium/low，note 写明假设。
-4. 不确定食物重量时，请用常见份量保守估计，并在 note 或 answer 里说明。
-5. 稳定性规则：相同输入要给出相同 normalizedDietText；不要随意改食物名；优先使用“已知食物库”的名称，但用户提供了包装营养值或明确品类差异时例外。
-6. 已知食物库里已有的食物，不要在 foods 里重复估算营养；foods 只放未知食物或包装/图片里需要新增的数据。注意：如果用户输入的是更具体的品牌/品类/配方，例如低脂牛奶、高钙牛奶、脱脂牛奶、某品牌牛奶，即使库里已有“牛奶/全脂牛奶”，也要把这个具体名称当作新食物补充 foods。
-7. 如果用户给出了任何食物的包装营养差异，例如“蛋白3.6g/100ml”“每100g热量250kcal”“脂肪10g/100g”，不要归并到已知食物，也不要只回答“略有差异”。必须在 normalizedDietText 使用可区分的新名称，例如“牛奶蛋白3.6g每100ml，200ml”或“面包热量250kcal每100g，100g”，并在 foods 中新增同名食物。serving 用对应的 100ml 或 100g，nutrition 至少填入用户给出的营养值，其余营养按包装或合理估算填写。如果你无法判断是否同一种食物，在 answer 中提示需要确认，但不要擅自合并到旧食物。
-8. 只返回 JSON，不要 Markdown，不要解释性前后缀。
-9. 如果你需要回答“今天会瘦多少”“明天体重会怎么变”“最近为什么掉得快或不掉”等体重变化问题，必须把糖原和糖原结合水当作有限的短期波动来源，不能默认它们每天都能继续按同样幅度下降。若最近几天碳水已连续偏低，后续糖原和结合水的下降幅度要明显收窄；同时要一起考虑脂肪、钠、水分、肠道内容物和训练恢复。
-10. 用户可以把记录日期写在整段三餐的开头或结尾，例如“昨天”“前天”“上周三”“2026年6月25日”“6月25号”。请将明确或可合理判断的日期换算成 YYYY-MM-DD，填入 recordDate，并从 normalizedDietText 中删除日期说明。相对日期必须以“系统今天”为基准；如果用户没有指定日期，recordDate 必须返回空字符串，不要自行猜测。
+2. 图片不只用于营养成分表，必须根据图片类型完整处理：
+   - 菜单、称重屏、结算清单或小票：OCR 识别每个菜名和对应克数；价格不是食物重量，不计入营养。
+   - 实物餐盘或食物照片：识别所有可见食物，结合碗、盘、餐具等比例保守估计实际可食用量；看不清的项目不要编造，在 answer 中指出需要确认的内容。
+   - 包装营养成分表：优先采用图片上能清楚读出的精确数值和每份/每100g基准。
+3. 必须把用户文字和图片合并理解。“如图”表示图片里的食物属于文字指定的那一餐；用户明确写出的菜名、数量、吃法和实际食用情况优先于图片默认判断。图片中列出的食物除非用户说明没吃，否则都要记录，不能只挑一部分。
+4. 对实际吃法作营养修正：涮汤/过水不能把油脂和钠归零，只能保守降低表面附着的油和盐；去皮、吐皮、去骨或剩下没吃的部分不计入可食量；“全瘦”按瘦肉估算。此类修正必须使用可区分的食物名，例如“涮汤双椒肉丝”“去皮涮汤照烧鸡排”“涮汤全瘦叉烧”，并在 foods 中新增同名营养数据，不能套用未修正的普通菜品。
+5. 图片有明确菜品克数时，normalizedDietText 保留修正后的实际可食克数；foods 的 serving 优先使用 100g，nutrition 填该修正菜品每100g营养，系统会按实际克数缩放。图片没有可靠克数时才按常见份量估算，并在 note 或 answer 里写明估算依据和不确定性。
+6. 如果用户是在问问题，请在 answer 中直接回答。
+7. 如果识别出本工具可能没有的新食物、包装食品、图片里的食物，给出 foods 营养数据估算。dataSource 写“AI估算”，confidence 为 high/medium/low，note 写明熟重/可食部、烹饪和涮汤去皮等假设。
+8. 稳定性规则：相同输入和相同图片要给出相同 normalizedDietText；不要随意改食物名；优先使用“已知食物库”的名称，但用户提供了包装营养值、明确品类差异或特殊吃法时例外。
+9. 已知食物库里已有的食物，不要在 foods 里重复估算营养；foods 只放未知食物或包装/图片里需要新增的数据。注意：如果用户输入的是更具体的品牌/品类/配方，例如低脂牛奶、高钙牛奶、脱脂牛奶、某品牌牛奶，即使库里已有“牛奶/全脂牛奶”，也要把这个具体名称当作新食物补充 foods。
+10. 如果用户给出了任何食物的包装营养差异，例如“蛋白3.6g/100ml”“每100g热量250kcal”“脂肪10g/100g”，不要归并到已知食物，也不要只回答“略有差异”。必须在 normalizedDietText 使用可区分的新名称，例如“牛奶蛋白3.6g每100ml，200ml”或“面包热量250kcal每100g，100g”，并在 foods 中新增同名食物。serving 用对应的 100ml 或 100g，nutrition 至少填入用户给出的营养值，其余营养按包装或合理估算填写。如果你无法判断是否同一种食物，在 answer 中提示需要确认，但不要擅自合并到旧食物。
+11. 只返回 JSON，不要 Markdown，不要解释性前后缀。
+12. 如果你需要回答“今天会瘦多少”“明天体重会怎么变”“最近为什么掉得快或不掉”等体重变化问题，必须把糖原和糖原结合水当作有限的短期波动来源，不能默认它们每天都能继续按同样幅度下降。若最近几天碳水已连续偏低，后续糖原和结合水的下降幅度要明显收窄；同时要一起考虑脂肪、钠、水分、肠道内容物和训练恢复。
+13. 用户可以把记录日期写在整段三餐的开头或结尾，例如“昨天”“前天”“上周三”“2026年6月25日”“6月25号”。请将明确或可合理判断的日期换算成 YYYY-MM-DD，填入 recordDate，并从 normalizedDietText 中删除日期说明。相对日期必须以“系统今天”为基准；如果用户没有指定日期，recordDate 必须返回空字符串，不要自行猜测。
 
 系统今天：${todayIso()}
 当前页面日期：${selectedDate}
 本地日期初步识别：${localDateHint || "未识别，由你判断是否存在模糊日期表达"}
+附加图片：
+${imageContext}
 当前目标：热量 ${profile.calMin}-${profile.calMax} kcal；蛋白质 ${profile.proteinMin}-${profile.proteinMax}g；碳水 ${profile.carbMin}-${profile.carbMax}g；脂肪 ${profile.fatMin}-${profile.fatMax}g；钠 <${profile.sodiumMax}mg。
 到昨天为止的连续低碳天数：${priorLowCarbDays} 天。
 最近已保存记录：
@@ -2746,7 +2779,7 @@ function renderAiAuditResult(audit) {
 
 function getAiInterpretCacheKey(inputText, images, contextDate = selectedDate) {
   const imageSignature = (images || []).map((image) => image.dataUrl).join("|");
-  return hashString(["date-routing-v1", todayIso(), contextDate, inputText || "", imageSignature].join("\n---\n"));
+  return hashString(["meal-vision-v2", todayIso(), contextDate, inputText || "", imageSignature].join("\n---\n"));
 }
 
 function getCachedAiInterpretation(cacheKey) {
@@ -3221,7 +3254,7 @@ function buildChatCompletionsRequestBody(prompt, settings, imageDataUrls = [], m
         role: "system",
         content:
           mode === "unified"
-            ? "你是饮食记录和营养分析助手。你可以解读文字和图片，也要识别用户写在三餐开头或结尾的记录日期。必须只输出 JSON，不要输出 Markdown。涉及体重变化估算时，要对糖原和糖原结合水保持保守，不能假定它们每天都能持续按同样幅度下降。"
+            ? "你是饮食记录和营养分析助手。你必须结合用户文字识别餐食照片、菜单称重清单和营养成分表，估算实际可食量及营养，也要识别记录日期。必须只输出 JSON，不要输出 Markdown。涉及体重变化估算时，要对糖原和糖原结合水保持保守，不能假定它们每天都能持续按同样幅度下降。"
             : mode === "audit"
               ? "你是饮食报告计算审核员。你只审核本地规则结果，指出疑点和建议，不要直接覆盖本地数值。必须只输出 JSON，不要输出 Markdown。"
               : "你是营养数据估算助手。你必须谨慎估算食物营养数据，不确定时说明假设。只输出 JSON，不要输出 Markdown。",
@@ -3389,7 +3422,7 @@ function buildUnifiedOpenAiRequestBody(prompt, settings, imageDataUrls = []) {
       {
         role: "system",
         content:
-          "你是饮食记录和营养分析助手。你可以解读文字和图片，也要识别用户写在三餐开头或结尾的记录日期。必须只输出符合 schema 的 JSON。涉及体重变化估算时，要对糖原和糖原结合水保持保守，不能假定它们每天都能持续按同样幅度下降。",
+          "你是饮食记录和营养分析助手。你必须结合用户文字识别餐食照片、菜单称重清单和营养成分表，估算实际可食量及营养，也要识别记录日期。必须只输出符合 schema 的 JSON。涉及体重变化估算时，要对糖原和糖原结合水保持保守，不能假定它们每天都能持续按同样幅度下降。",
       },
       {
         role: "user",
